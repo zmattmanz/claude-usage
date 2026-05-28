@@ -1,0 +1,13 @@
+.pio/
+.vscode/
+build/
+__pycache__/
+*.o
+*.a
+*.bin
+*.elf
+*.map
+*.hex
+*.dblite
+.DS_Store
+Thumbs.db
