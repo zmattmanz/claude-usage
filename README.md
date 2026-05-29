@@ -2,8 +2,6 @@
 
 A desk gadget that shows your Claude AI usage limits in real time on a tiny always-on screen.
 
-Built on the [M5StickS3](https://shop.m5stack.com/products/m5sticks3) (ESP32-S3, 135×240 TFT).
-
 ## Overview
 
 If you've hit Claude's usage limits mid-conversation, you know the frustration. Your only options are keeping a second tab open to monitor it or squinting at the usage indicator in the chat window. Neither is great when you're actually trying to get work done.
@@ -23,9 +21,9 @@ Four screens, one button press apart:
 
 **Shake to refresh.** Don't want to wait 5 minutes? Shake the device or press the side button (B). An orbiting dot plays while it syncs.
 
-**Three themes.** Double-press the side button (B) to rotate:
-- **Amber Cream**—warm orange (default)
-- **Sage**—muted green
+**Three 'Themes'.** There are three "themes". They have official names: Double-press the side button (B) to rotate:
+- **Amber Cream**—warm orange (default), vintage
+- **Sage**—muted green, industrial
 - **Electric Indigo**—cool blue/purple
 
 Persists across reboots.
@@ -90,13 +88,14 @@ Long-press the front button (A) for 3 seconds—a progress bar fills at the bott
 | Shake refresh | Shake the device |
 | Enter setup | Hold front button (A), 3 seconds |
 
-## Limitations
+## Limitations + Known Issues
 
 - **The usage endpoint is unofficial.** This reads from Claude.ai's internal API, not a documented public endpoint. Anthropic could change or remove it at any time.
 - **Session cookies expire.** There's no way around this—you'll need to update your `sessionKey` periodically. The Key Status screen tells you when it's getting close.
 - **Landscape is session-only.** The other three screens are portrait only. Tilt back upright to access them.
 - **No battery percentage.** The M5PM1 power chip doesn't expose accurate battery telemetry. The device shows "USB" when plugged in, which is the honest answer. It's designed to stay plugged in anyway.
 - **Requires WiFi.** No offline mode. If your network goes down, the device shows stale data until it reconnects.
+- **Flickering.** The device may flicker slightly at times. I am working on a fix for this.
 
 ## Build
 
