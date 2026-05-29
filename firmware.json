@@ -1,0 +1,17 @@
+{
+  "name": "Claude Usage",
+  "version": "1.0.0",
+  "author": "Matthew Deal",
+  "description": "Real-time Claude AI usage dashboard. Shows your session usage percentage, reset countdown, historical trends, and key status across four screens. Auto-updates every 5 minutes. Three color themes, landscape mode, shake-to-refresh, and an 80% usage alert. Setup via WiFi captive portal—no code required.",
+  "device": "StickS3",
+  "category": "Application",
+  "firmware": [
+    {
+      "address": "0x0000",
+      "path": "firmware_combined.bin"
+    }
+  ],
+  "repository": "https://github.com/matthewdeal/claude-usage",
+  "homepage": "https://github.com/matthewdeal/claude-usage",
+  "license": "MIT"
+}
