@@ -27,6 +27,8 @@
 #define DEG_TO_RAD 0.017453292519943295f
 #endif
 
+#define FIRMWARE_VERSION "1.1.0"
+
 static const char CONFIG_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -162,19 +164,19 @@ static Usage usage = {};
 // ──────────── Themes ────────────
 struct Theme {
   const char* name;
-  uint16_t meter, number, label, data, track, bg;
+  uint16_t meter, label, track, bg;
 };
 static const Theme THEMES[] = {
-  { "Sage",             0x6DB1, 0xFFFF, 0xBED9, 0xFFFF, 0x1903, 0x0841 },
-  { "Electric Indigo",  0x633E, 0xFFFF, 0xBDDF, 0xFFFF, 0x18E5, 0x0841 },
-  { "Amber Cream",      0xFD84, 0xFD84, 0xFF7A, 0xFE2B, 0x28E1, 0x0841 },
+  { "Sage",             0x6DB1, 0xBED9, 0x1903, 0x0841 },
+  { "Electric Indigo",  0x633E, 0xBDDF, 0x18E5, 0x0841 },
+  { "Amber Cream",      0xFD84, 0xFF7A, 0x28E1, 0x0841 },
 };
 static const uint8_t THEME_COUNT = 3;
 static uint8_t themeIdx = 2;
 inline const Theme& theme() { return THEMES[themeIdx]; }
 
 // ──────────── Screen State ────────────
-enum Screen { SCR_SESSION, SCR_WEEKLY, SCR_DEVICE, SCR_KEY, SCR_COUNT };
+enum Screen { SCR_SESSION, SCR_USAGE, SCR_CONNECTION, SCR_DEVICE, SCR_KEY, SCR_COUNT };
 static uint8_t currentScreen = SCR_SESSION;
 
 static uint32_t keySetEpoch = 0;
@@ -183,36 +185,44 @@ static float displayedWeeklyPct = 0;
 static float displayedSonnetPct = 0;
 static float displayedDesignPct = 0;
 static float breathPhase = 0.0f;
-static uint16_t currMeter, currNumber, currLabel, currTrack, currBg;
+static uint16_t currMeter, currLabel, currTrack, currBg;
 
 // ──────────── Timing ────────────
-const uint32_t FETCH_INTERVAL = 5 * 60 * 1000;
 static uint32_t lastFetchMs    = 0;
+
+static unsigned long getFetchInterval() {
+  float pct = usage.fiveHour.pct;
+  if (pct >= 80.0f) return 2UL * 60 * 1000;    // 2 min — critical, watch closely
+  if (pct >= 60.0f) return 5UL * 60 * 1000;    // 5 min — moderate
+  return 10UL * 60 * 1000;                      // 10 min — low usage, relax
+}
 static time_t   fiveHourResetEpoch = 0;
 static bool fetching = false;
-static int displayBatPct = -1;
-static uint32_t lastBatUpdateMs = 0;
 static uint32_t lastShakeRefresh = 0;
-static float usageHistory[6] = {0};
-static uint8_t historyIdx = 0;
-static uint8_t historyCount = 0;
+
 static uint32_t themeSaveAt = 0;
-static float pulseRadius = 0;
 static uint32_t lastPulseFrame = 0;
 static bool pulseActive = false;
 static bool isLandscape = false;
 static bool nightMode = false;
 static bool usageIdle = false;
+static bool keyExpired = false;
 static int idleFetchCount = 0;
 static float lastIdlePct = -1;
+static float lastChimePct = -1;   // previous fetch's % — for threshold-crossing chimes
 static float relaxBaseX = 20, relaxBaseY = 80;
 static float relaxVelX = 0.5f, relaxVelY = 0.25f;
 static float relaxPhase = 0;
+static float relaxDriftVX = 0, relaxDriftVY = 0;
+static float relaxDriftOX = 0, relaxDriftOY = 0;
+static M5Canvas* relaxCanvas = nullptr;
+static int relaxCanvasW = 0, relaxCanvasH = 0;
 static uint32_t lastOrientCheck = 0;
 static uint8_t orientLandscapeVotes = 0;
 static uint8_t orientPortraitVotes = 0;
 static uint32_t orientCooldown = 0;
 static const int W_L = 240, H_L = 135;
+static int landscapeTimerY = 59;  // computed by drawSessionLandscape, used by refreshTimerLandscape
 
 const int HISTORY_MAX = 288;  // 24 hours at 5-min intervals
 static float usageHistoryChart[HISTORY_MAX];
@@ -237,29 +247,6 @@ static uint16_t lerpColor(uint16_t from, uint16_t to, float t) {
        |  (uint16_t)(b1 + (int)((b2-b1)*t));
 }
 
-static void updateBattery() {
-  int32_t mv       = M5.Power.getBatteryVoltage();
-  bool    charging = M5.Power.isCharging();
-  int32_t level    = M5.Power.getBatteryLevel();
-
-  static int batLogCount = 0;
-  if (++batLogCount >= 5) {
-    batLogCount = 0;
-    Serial.printf("[bat] level=%d%% raw=%dmV charging=%d\n",
-      (int)level, (int)mv, charging);
-  }
-
-  // M5PM1 on M5StickS3 reports inaccurate battery levels.
-  // When charging, always show USB. Only show % when on battery AND level is valid.
-  if (charging) {
-    displayBatPct = -2;  // USB
-  } else if (level >= 0 && level <= 100) {
-    displayBatPct = level;
-  } else {
-    displayBatPct = -1;  // unknown
-  }
-}
-
 static void resetFont() {
   lcd.setFont(&fonts::Font0);
   lcd.setTextSize(1);
@@ -268,15 +255,6 @@ static void resetFont() {
 
 
 // ──────────── Config ────────────
-static void configSave() {
-  prefs.begin("claude", false);
-  prefs.putString("ssid", cfg.ssid);
-  prefs.putString("pass", cfg.pass);
-  prefs.putString("skey", cfg.sessionKey);
-  prefs.putString("org", cfg.orgId);
-  prefs.putBool("valid", true);
-  prefs.end();
-}
 static void saveChartHistory() {
   static uint8_t saveCounter = 0;
   saveCounter++;
@@ -320,46 +298,6 @@ static void configLoad() {
   keySetEpoch = prefs.getULong("keyset", 0);
   prefs.end();
 }
-static String serialReadLine(const char* prompt, bool secret = false, uint32_t timeoutMs = 120000) {
-  Serial.printf("%s: ", prompt);
-  String s;
-  uint32_t start = millis();
-  while (true) {
-    if (millis() - start > timeoutMs) {
-      Serial.println("\n[setup] Timeout — rebooting...");
-      delay(1000); ESP.restart();
-    }
-    if (Serial.available()) {
-      char c = Serial.read();
-      start = millis();  // reset timeout on each keypress
-      if (c == '\n' || c == '\r') { if (s.length() > 0) { Serial.println(); return s; } }
-      else if (c == 8 || c == 127) { if (s.length() > 0) { s.remove(s.length()-1); Serial.print("\b \b"); } }
-      else { s += c; Serial.print(secret ? '*' : c); }
-    }
-    delay(10);
-  }
-}
-static void configSetup() {
-  resetFont();
-  lcd.fillScreen(0);
-  lcd.setTextColor(0xFFFF, 0);
-  lcd.setCursor(4, 10); lcd.println("SETUP MODE");
-  lcd.setTextColor(0x8410, 0);
-  lcd.println("\nOpen serial monitor\nand enter config.\n115200 baud\n\nTimeout: 2 min");
-
-  Serial.println("\n=== Claude Usage Stick Setup ===\n");
-  strlcpy(cfg.ssid, serialReadLine("WiFi SSID").c_str(), sizeof(cfg.ssid));
-  strlcpy(cfg.pass, serialReadLine("WiFi Password", true).c_str(), sizeof(cfg.pass));
-  Serial.println("\nFrom Chrome: Application > Cookies > claude.ai");
-  strlcpy(cfg.orgId, serialReadLine("Org ID (lastActiveOrg)").c_str(), sizeof(cfg.orgId));
-  strlcpy(cfg.sessionKey, serialReadLine("Session Key", true).c_str(), sizeof(cfg.sessionKey));
-  cfg.valid = true;
-  configSave();
-  Serial.println("\nSaved! Rebooting...");
-  delay(1000);
-  ESP.restart();
-}
-
 // ──────────── WiFi ────────────
 static void startConfigMode();  // forward declaration
 
@@ -400,6 +338,7 @@ static void wifiConnect() {
     Serial.printf("[wifi] connected, IP=%s\n", WiFi.localIP().toString().c_str());
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // offset=0 = UTC — required for countdown timer
     struct tm tm_info; getLocalTime(&tm_info, 5000);
+    WiFi.setSleep(true);  // modem sleep between fetches — saves power, no UX cost
   } else {
     Serial.println("[wifi] connection failed, entering setup mode");
     lcd.fillRect(0, 0, W, H, currBg);
@@ -482,6 +421,13 @@ static void fetchUsage() {
           }
         }
       }
+      // After a window reset the API may return no (or a stale) resets_at.
+      // Clear a past epoch so the reset-passed auto-refresh can't loop.
+      {
+        time_t nowt; time(&nowt);
+        if (nowt > 1704067200 && fiveHourResetEpoch > 0 && (time_t)fiveHourResetEpoch <= nowt)
+          fiveHourResetEpoch = 0;
+      }
       JsonObject sd = doc["seven_day"];
       if (!sd.isNull()) { usage.weekly.pct = sd["utilization"]|0.0f; usage.weekly.available = true;
         const char* r = sd["resets_at"]; if (r) parseResetTime(r, usage.weekly.resets, 32); }
@@ -490,6 +436,7 @@ static void fetchUsage() {
       JsonObject dm = doc["seven_day_omelette"];
       if (!dm.isNull()) { usage.design.pct = dm["utilization"]|0.0f; usage.design.available = true; }
       usage.valid = true; usage.error[0] = 0; usage.fetchedAt = millis();
+      keyExpired = false;
       if (keySetEpoch == 0) {
         time_t now; time(&now);
         if (now > 1704067200) {  // 2024-01-01 UTC — confirms NTP synced
@@ -503,24 +450,44 @@ static void fetchUsage() {
         }
       }
       Serial.printf("[fetch] 5h=%.0f%% weekly=%.0f%%\n", usage.fiveHour.pct, usage.weekly.pct);
-      usageHistory[historyIdx] = usage.fiveHour.pct;
-      historyIdx = (historyIdx + 1) % 6;
-      if (historyCount < 6) historyCount++;
       usageHistoryChart[historyChartIdx] = usage.fiveHour.pct;
       historyChartIdx = (historyChartIdx + 1) % HISTORY_MAX;
       if (historyChartCount < HISTORY_MAX) historyChartCount++;
       saveChartHistory();
       if (M5.Speaker.isEnabled()) {
-        if (usage.fiveHour.pct > 80) {
-          M5.Speaker.tone(1600, 20); delay(50);
-          M5.Speaker.tone(1200, 20); delay(50);
-          M5.Speaker.tone(800, 35);
+        float cur  = usage.fiveHour.pct;
+        float prev = lastChimePct;
+        if (prev < 0) {
+          // First fetch since boot — set baseline, just a subtle refresh ding
+          M5.Speaker.tone(1600, 10); delay(40); M5.Speaker.tone(1800, 10);
+        } else if (prev - cur > 10.0f && cur < 15.0f) {
+          // Window reset — usage dropped sharply. Resolved ascending chord ("you're free")
+          M5.Speaker.tone(1047, 45); delay(55);   // C6
+          M5.Speaker.tone(1319, 45); delay(55);   // E6
+          M5.Speaker.tone(1568, 45); delay(55);   // G6
+          M5.Speaker.tone(2093, 70);              // C7
+        } else if (prev < 90 && cur >= 90) {
+          // Crossed 90% — urgent descending
+          M5.Speaker.tone(2200, 35); delay(45);
+          M5.Speaker.tone(1700, 35); delay(45);
+          M5.Speaker.tone(1200, 55);
+        } else if (prev < 75 && cur >= 75) {
+          // Crossed 75% — sharper triple rise
+          M5.Speaker.tone(1500, 28); delay(38);
+          M5.Speaker.tone(1900, 28); delay(38);
+          M5.Speaker.tone(2300, 36);
+        } else if (prev < 50 && cur >= 50) {
+          // Crossed 50% — gentle two-note rise
+          M5.Speaker.tone(1400, 30); delay(45);
+          M5.Speaker.tone(1700, 35);
         } else {
+          // Normal fetch, no boundary crossed — subtle refresh ding
           M5.Speaker.tone(1600, 10); delay(40); M5.Speaker.tone(1800, 10);
         }
+        lastChimePct = cur;
       }
     } else { strlcpy(usage.error, "JSON error", 64); }
-  } else if (code == 401 || code == 403) { strlcpy(usage.error, "Session expired", 64); }
+  } else if (code == 401 || code == 403) { strlcpy(usage.error, "Session expired", 64); keyExpired = true; }
   else { snprintf(usage.error, 64, "HTTP %d", code); }
   http.end();
   yield();
@@ -546,53 +513,63 @@ static void drawSyncIcon() {
   int cx, cy;
   getSyncPos(cx, cy);
   if (WiFi.status() != WL_CONNECTED) {
-    lcd.drawCircle(cx, cy, 2, 0xFFFF);
+    lcd.drawCircle(cx, cy, 3, 0xFFFF);
   } else {
-    lcd.fillCircle(cx, cy, 2, currMeter);
+    lcd.fillCircle(cx, cy, 3, currMeter);
   }
 }
 
 static void drawSyncIndicator() {
   int cx, cy;
   getSyncPos(cx, cy);
-  float orbitR = 2.5f;
-  int clearR = 7;
-  int frames = 22;
 
-  for (int f = 0; f < frames; f++) {
-    lcd.fillCircle(cx, cy, clearR, currBg);
-    float t = (float)f / frames;
-    // Ease-in for first quarter, then constant speed
-    float speedT;
-    if (t < 0.15f) {
-      float e = t / 0.15f;
-      speedT = 0.15f * (e * e);  // quadratic ease-in
-    } else {
-      speedT = t;
+  const int lineW  = 22;
+  const int amp    = 4;
+  const int frames = 56;                                  // smoother (~1s)
+  const float k = (2.0f * 3.14159f * 2.0f) / lineW;       // exactly 2 even waves
+  const int spW = lineW + 5;
+  const int spH = (amp + 2) * 2 + 1;
+  const int sx  = cx - lineW - 1;
+  const int sy  = cy - amp - 2;
+  const int midY = amp + 2;
+
+  M5Canvas spr(&M5.Display);
+  spr.setColorDepth(16);
+  spr.setPsram(true);
+  bool useSprite = spr.createSprite(spW, spH);
+
+  if (useSprite) {
+    for (int f = 0; f < frames; f++) {
+      float phase = f * 0.42f;
+
+      float life;
+      if (f < 5)                 life = f / 5.0f;
+      else if (f >= frames - 5)  life = (frames - 1 - f) / 5.0f;
+      else                       life = 1.0f;
+
+      spr.fillSprite(currBg);
+      int prevYp = midY;
+      for (int xx = 0; xx <= lineW; xx++) {
+        // Pure sine wave — uniform amplitude across the whole line, no taper
+        float yy = midY + sinf(xx * k + phase) * amp * life;
+        int yp = (int)(yy + 0.5f);
+        if (xx > 0) {
+          spr.drawLine(xx - 1, prevYp,     xx, yp,     currMeter);
+          spr.drawLine(xx - 1, prevYp + 1, xx, yp + 1, currMeter);
+        }
+        prevYp = yp;
+      }
+      spr.pushSprite(sx, sy);
+      delay(18);
     }
-    float angle = speedT * 6.2832f * 2.0f;
-    // Radius eases from 0 to full over first few frames
-    float r = orbitR;
-    if (f < 4) r = orbitR * (float)(f + 1) / 4.0f;
-
-    int dx = cx + (int)(cosf(angle) * r);
-    int dy = cy + (int)(sinf(angle) * r);
-    lcd.fillCircle(dx, dy, 3, 0xFFFF);
-    delay(28);
+    spr.deleteSprite();
   }
 
-  lcd.fillCircle(cx, cy, clearR, currBg);
-  lcd.fillCircle(cx, cy, 2, currMeter);
+  lcd.fillRect(sx, sy, spW, spH, currBg);
+  lcd.fillCircle(cx, cy, 3, currMeter);
 }
 
-static int usageVelocity() {
-  if (historyCount < 2) return 0;
-  int oldIdx = (historyIdx + 6 - 2) % 6;
-  float diff = usageHistory[(historyIdx + 5) % 6] - usageHistory[oldIdx];
-  if (diff > 1.5f)  return  1;
-  if (diff < -1.5f) return -1;
-  return 0;
-}
+
 
 static void drawSpaced(const char* text, int x, int y, int spacing) {
   lcd.setTextDatum(TL_DATUM);
@@ -636,116 +613,224 @@ static void drawHeader(const char* title) {
   lcd.setFont(&BebasNeue20);
   lcd.setTextColor(currLabel, currBg);
   lcd.setTextDatum(TL_DATUM);
-  int titleY = 8;
-  drawSpaced(title, 8, titleY, 2);
-  int textCenterY = titleY + lcd.fontHeight() / 2;
+  drawSpaced(title, 8, 8, 2);
   drawSyncIcon();
 }
 
-static void refreshArc() {
-  if (!usage.valid || currentScreen != SCR_SESSION || isLandscape) return;
-
-  float dpct = displayedPct;
-  if (dpct < 0.1f) {
-    const int CX = W / 2, CY = CONTENT_TOP + 68;
-    const int R_OUT = 54, R_IN = 46;
-    lcd.fillArc(CX, CY, R_OUT, R_IN, 150.0f, 390.0f, currTrack);
-    lcd.setFont(&BebasNeue44);
-    lcd.setTextDatum(MC_DATUM);
-    lcd.setTextColor(currMeter, currBg);
-    lcd.drawString("0%", CX, CY);
-    lcd.setTextDatum(TL_DATUM);
-    return;
-  }
-
-  // Alert flash — red pulse when usage > 80%
-  uint16_t arcColor = currMeter;
-  bool alertFlash = false;
-  if (usage.fiveHour.pct > 80.0f) {
-    int cycle = (int)(millis() % 2000);
-    alertFlash = (cycle < 400);
-    if (alertFlash) arcColor = 0xF800;
-  }
+static void drawArcAA() {
+  if (!usage.valid || isLandscape || currentScreen != SCR_SESSION) return;
 
   const int CX = W / 2, CY = CONTENT_TOP + 68;
   const int R_OUT = 54, R_IN = 46;
-  const float ARC_START = 150.0f, ARC_SWEEP = 240.0f;
-  const float ARC_MAX = ARC_START + ARC_SWEEP;
-  float midR = (R_OUT + R_IN) / 2.0f;
-  float capR = (R_OUT - R_IN) / 2.0f;
+  const float ARC_START = 150.0f, ARC_SWEEP = 240.0f, ARC_MAX = 390.0f;
+  const int S = 3;
+  const int box = (R_OUT + 2) * 2;
+  const int boxHalf = box / 2;
+  const int bx = CX - boxHalf, by = CY - boxHalf;
+  const int SWp = box * S, SHp = box * S;
 
-  float drawPct = dpct;
-  if (drawPct < 2.0f) drawPct = 2.0f;
+  static M5Canvas* hi = nullptr;
+  if (!hi) {
+    hi = new M5Canvas(&M5.Display);
+    hi->setColorDepth(16);
+    hi->setPsram(true);
+    if (!hi->createSprite(SWp, SHp)) { delete hi; hi = nullptr; return; }
+  }
+
+  // Alert flash color
+  uint16_t arcColor = currMeter;
+  bool flash = false;
+  if (usage.fiveHour.pct > 80.0f) {
+    flash = ((int)(millis() % 2000) < 400);
+    if (flash) arcColor = 0xF800;
+  }
+
+  float dpct = displayedPct;
+  float drawPct = dpct; if (drawPct < 2.0f) drawPct = 2.0f;
   float baseEnd = ARC_START + ARC_SWEEP * drawPct / 100.0f;
   if (baseEnd > ARC_MAX) baseEnd = ARC_MAX;
 
-  float animEnd = baseEnd + sinf(breathPhase) * 4.0f;
-  if (animEnd < ARC_START + 2.0f) animEnd = ARC_START + 2.0f;
-  if (animEnd > ARC_MAX) animEnd = ARC_MAX;
+  float shadow1End = baseEnd + 7.0f  + sinf(breathPhase * 0.80f) * 2.5f;
+  float shadow2End = baseEnd + 16.0f + sinf(breathPhase * 0.45f) * 4.5f;
+  if (shadow1End > ARC_MAX) shadow1End = ARC_MAX;
+  if (shadow2End > ARC_MAX) shadow2End = ARC_MAX;
+  if (shadow2End < shadow1End) shadow2End = shadow1End;
 
-  float deepEnd = baseEnd + 12.0f + sinf(breathPhase * 0.65f) * 10.0f
-                + sinf(breathPhase * 0.28f) * 5.0f
-                + sinf(breathPhase * 0.15f) * 3.0f;
-  if (deepEnd > ARC_MAX) deepEnd = ARC_MAX;
+  // Render the arc band at high resolution
+  float hcx = boxHalf * S, hcy = boxHalf * S;
+  int Rout = R_OUT * S, Rin = R_IN * S;
+  float midR = (Rout + Rin) / 2.0f, capR = (Rout - Rin) / 2.0f;
 
-  float medEnd = baseEnd + 5.0f + sinf(breathPhase * 0.8f) * 6.0f
-               + sinf(breathPhase * 0.35f) * 3.0f;
-  if (medEnd > ARC_MAX) medEnd = ARC_MAX;
+  hi->fillSprite(currBg);
+  hi->fillArc(hcx, hcy, Rout, Rin, ARC_START, ARC_MAX, currTrack);
+  if (dpct > 0.5f) {
+    if (shadow2End > baseEnd)
+      hi->fillArc(hcx, hcy, Rout, Rin, baseEnd, shadow2End, lerpColor(currBg, arcColor, 0.42f));
+    if (shadow1End > baseEnd)
+      hi->fillArc(hcx, hcy, Rout, Rin, baseEnd, shadow1End, lerpColor(currBg, arcColor, 0.65f));
+    hi->fillArc(hcx, hcy, Rout, Rin, ARC_START, baseEnd, arcColor);
+    float sr = ARC_START * DEG_TO_RAD;
+    hi->fillCircle(hcx + cosf(sr) * midR, hcy + sinf(sr) * midR, capR, arcColor);
+  }
 
-  float furthest = fmaxf(animEnd, fmaxf(deepEnd, medEnd));
-  float trackEnd = baseEnd + 30.0f;
-  if (trackEnd > ARC_MAX) trackEnd = ARC_MAX;
-  if (furthest < trackEnd)
-    lcd.fillArc(CX, CY, R_OUT, R_IN, furthest, trackEnd, currTrack);
-
-  if (deepEnd > animEnd)
-    lcd.fillArc(CX, CY, R_OUT, R_IN, animEnd, deepEnd, lerpColor(currBg, arcColor, 0.35f));
-
-  if (medEnd > animEnd)
-    lcd.fillArc(CX, CY, R_OUT, R_IN, animEnd, medEnd, lerpColor(currBg, arcColor, 0.55f));
-
-  float fillStart = baseEnd - 10.0f;
-  if (fillStart < ARC_START) fillStart = ARC_START;
-  if (animEnd > fillStart) {
-    lcd.fillArc(CX, CY, R_OUT, R_IN, fillStart, animEnd, arcColor);
-    if (animEnd < ARC_MAX - 2.0f) {
-      float endRad = animEnd * DEG_TO_RAD;
-      lcd.fillCircle(CX + (int)(midR * cosf(endRad)), CY + (int)(midR * sinf(endRad)), (int)capR, arcColor);
+  // Downscale only the ring band → leaves the center (number) untouched
+  int n = S * S;
+  float rInClear = R_IN - 2, rOutClear = R_OUT + 2;
+  for (int oy = 0; oy < box; oy++) {
+    for (int ox = 0; ox < box; ox++) {
+      float ddx = ox - boxHalf, ddy = oy - boxHalf;
+      float d = sqrtf(ddx * ddx + ddy * ddy);
+      if (d < rInClear || d > rOutClear) continue;
+      int r = 0, g = 0, b = 0;
+      for (int sy = 0; sy < S; sy++)
+        for (int sx = 0; sx < S; sx++) {
+          uint16_t pv = hi->readPixel(ox * S + sx, oy * S + sy);
+          r += (pv >> 11) & 0x1F; g += (pv >> 5) & 0x3F; b += pv & 0x1F;
+        }
+      uint16_t avg = (uint16_t)(((r / n) << 11) | ((g / n) << 5) | (b / n));
+      if (avg == currBg) continue;   // skip the ring's bottom gap so it doesn't cover the label
+      lcd.drawPixel(bx + ox, by + oy, avg);
     }
   }
 
-  // Flash status label red when alert is active
+  // Preserve the 80% status-label flash
   if (usage.fiveHour.pct > 80.0f) {
-    const int CX = W / 2;
     lcd.setFont(&BebasNeue22);
-    lcd.setTextColor(alertFlash ? 0xF800 : currMeter, currBg);
+    lcd.setTextColor(flash ? 0xF800 : currMeter, currBg);
     int labelY = 155 - lcd.fontHeight() / 2;
     lcd.fillRect(8, labelY, W - 16, lcd.fontHeight() + 2, currBg);
-    drawSpacedCentered(pctLabel(usage.fiveHour.pct), CX, labelY, 2);
+    drawSpacedCentered(pctLabel(usage.fiveHour.pct), W / 2, labelY, 2);
   }
+}
+
+static void drawArcAALandscape() {
+  if (!usage.valid || !isLandscape) return;
+
+  const int CX = 68, CY = H_L / 2;
+  const int R_OUT = 50, R_IN = 42;
+  const float ARC_START = 150.0f, ARC_SWEEP = 240.0f, ARC_MAX = 390.0f;
+  const int S = 3;
+  const int box = (R_OUT + 2) * 2;
+  const int boxHalf = box / 2;
+  const int bx = CX - boxHalf, by = CY - boxHalf;
+  const int SWp = box * S, SHp = box * S;
+
+  static M5Canvas* hiL = nullptr;
+  if (!hiL) {
+    hiL = new M5Canvas(&M5.Display);
+    hiL->setColorDepth(16);
+    hiL->setPsram(true);
+    if (!hiL->createSprite(SWp, SHp)) { delete hiL; hiL = nullptr; return; }
+  }
+
+  uint16_t arcColor = currMeter;
+  bool flash = false;
+  if (usage.fiveHour.pct > 80.0f) {
+    flash = ((int)(millis() % 2000) < 400);
+    if (flash) arcColor = 0xF800;
+  }
+
+  float dpct = displayedPct;
+  float drawPct = dpct; if (drawPct < 2.0f) drawPct = 2.0f;
+  float baseEnd = ARC_START + ARC_SWEEP * drawPct / 100.0f;
+  if (baseEnd > ARC_MAX) baseEnd = ARC_MAX;
+
+  float shadow1End = baseEnd + 7.0f  + sinf(breathPhase * 0.80f) * 2.5f;
+  float shadow2End = baseEnd + 16.0f + sinf(breathPhase * 0.45f) * 4.5f;
+  if (shadow1End > ARC_MAX) shadow1End = ARC_MAX;
+  if (shadow2End > ARC_MAX) shadow2End = ARC_MAX;
+  if (shadow2End < shadow1End) shadow2End = shadow1End;
+
+  float hcx = boxHalf * S, hcy = boxHalf * S;
+  int Rout = R_OUT * S, Rin = R_IN * S;
+  float midR = (Rout + Rin) / 2.0f, capR = (Rout - Rin) / 2.0f;
+
+  hiL->fillSprite(currBg);
+  hiL->fillArc(hcx, hcy, Rout, Rin, ARC_START, ARC_MAX, currTrack);
+  if (dpct > 0.5f) {
+    if (shadow2End > baseEnd)
+      hiL->fillArc(hcx, hcy, Rout, Rin, baseEnd, shadow2End, lerpColor(currBg, arcColor, 0.42f));
+    if (shadow1End > baseEnd)
+      hiL->fillArc(hcx, hcy, Rout, Rin, baseEnd, shadow1End, lerpColor(currBg, arcColor, 0.65f));
+    hiL->fillArc(hcx, hcy, Rout, Rin, ARC_START, baseEnd, arcColor);
+    float sr = ARC_START * DEG_TO_RAD;
+    hiL->fillCircle(hcx + cosf(sr) * midR, hcy + sinf(sr) * midR, capR, arcColor);
+  }
+
+  int n = S * S;
+  float rInClear = R_IN - 2, rOutClear = R_OUT + 2;
+  for (int oy = 0; oy < box; oy++) {
+    for (int ox = 0; ox < box; ox++) {
+      float ddx = ox - boxHalf, ddy = oy - boxHalf;
+      float d = sqrtf(ddx * ddx + ddy * ddy);
+      if (d < rInClear || d > rOutClear) continue;
+      int r = 0, g = 0, b = 0;
+      for (int sy = 0; sy < S; sy++)
+        for (int sx = 0; sx < S; sx++) {
+          uint16_t pv = hiL->readPixel(ox * S + sx, oy * S + sy);
+          r += (pv >> 11) & 0x1F; g += (pv >> 5) & 0x3F; b += pv & 0x1F;
+        }
+      uint16_t avg = (uint16_t)(((r / n) << 11) | ((g / n) << 5) | (b / n));
+      if (avg == currBg) continue;
+      lcd.drawPixel(bx + ox, by + oy, avg);
+    }
+  }
+
+  // 80% status-label flash (landscape position, below the arc)
+  if (usage.fiveHour.pct > 80.0f) {
+    lcd.setFont(&BebasNeue22);
+    int statusY = CY + lcd.fontHeight() + 10;
+    lcd.setTextColor(flash ? 0xF800 : currMeter, currBg);
+    lcd.fillRect(CX - 60, statusY, 120, lcd.fontHeight() + 2, currBg);
+    drawSpacedCentered(pctLabel(usage.fiveHour.pct), CX, statusY, 2);
+  }
+}
+
+static bool formatCountdown(char* buf, size_t len) {
+  if (fiveHourResetEpoch <= 0) {
+    strlcpy(buf, "--:--:--", len);
+    return true;
+  }
+  time_t t; time(&t);
+  int remaining = (int)(fiveHourResetEpoch - t);
+  if (remaining <= 0) {
+    strlcpy(buf, "--:--:--", len);
+    return true;
+  }
+  snprintf(buf, len, "%02d:%02d:%02d",
+           remaining / 3600, (remaining % 3600) / 60, remaining % 60);
+  return false;
 }
 
 static void refreshTimer() {
   if (!usage.valid || currentScreen != SCR_SESSION) return;
-  if (fiveHourResetEpoch <= 0) return;
+
+  char countdownBuf[12];
+  bool expired = formatCountdown(countdownBuf, sizeof(countdownBuf));
 
   const int CX = W / 2;
   const int resetsY = 183;
 
-  time_t t; time(&t);
-  int remaining = (int)(fiveHourResetEpoch - t);
-  char countdownBuf[12];
-  if (remaining <= 0) {
-    strlcpy(countdownBuf, "--:--:--", sizeof(countdownBuf));
-  } else {
-    snprintf(countdownBuf, sizeof(countdownBuf), "%02d:%02d:%02d",
-             remaining / 3600, (remaining % 3600) / 60, remaining % 60);
-  }
-
   lcd.setFont(&BebasNeue20);
   lcd.setTextDatum(MC_DATUM);
-  lcd.setTextColor(remaining <= 0 ? currLabel : 0xFFFF, currBg);
+  lcd.setTextColor(expired ? currLabel : 0xFFFF, currBg);
   lcd.drawString(countdownBuf, CX, resetsY + 26);
+  lcd.setTextDatum(TL_DATUM);
+}
+
+static void drawExpiredNotice() {
+  int sw = isLandscape ? W_L : W;
+  int sh = isLandscape ? H_L : H;
+  int cy = sh / 2;
+  lcd.setTextDatum(MC_DATUM);
+  lcd.setFont(&BebasNeue22);
+  lcd.setTextColor(0xF800, currBg);
+  lcd.drawString("KEY EXPIRED", sw / 2, cy - 16);
+  lcd.setFont(&Montserrat11);
+  lcd.setTextColor(currLabel, currBg);
+  lcd.drawString("Session cookie no longer valid", sw / 2, cy + 6);
+  lcd.setTextColor(0xFFFF, currBg);
+  lcd.drawString("Hold A for 3s to re-setup", sw / 2, cy + 22);
   lcd.setTextDatum(TL_DATUM);
 }
 
@@ -755,13 +840,9 @@ static void drawSession() {
 
   const int CX = W / 2;
 
-  // Header
-  lcd.setFont(&BebasNeue20);
-  lcd.setTextColor(currLabel, currBg);
-  lcd.setTextDatum(TL_DATUM);
-  drawSpaced("SESSION", 8, 8, 2);
-  int textCenterY = 8 + lcd.fontHeight() / 2;
-  drawSyncIcon();
+  drawHeader("SESSION");
+
+  if (keyExpired) { drawExpiredNotice(); return; }
 
   if (!usage.valid) {
     lcd.setFont(&Montserrat11);
@@ -776,38 +857,8 @@ static void drawSession() {
   if (isnan(dpct) || isinf(dpct)) { dpct = 0; displayedPct = 0; }
   float pct  = usage.fiveHour.pct;
   const int CY = CONTENT_TOP + 68;
-  const int R_OUT = 54, R_IN = 46;
-  const float ARC_START = 150.0f, ARC_SWEEP = 240.0f;
-  float midR = (R_OUT + R_IN) / 2.0f;
-  float capR = (R_OUT - R_IN) / 2.0f;
-  float startRad = ARC_START * DEG_TO_RAD;
-  float endRad   = (ARC_START + ARC_SWEEP) * DEG_TO_RAD;
 
-  // Track arc with round caps
-  lcd.fillArc(CX, CY, R_OUT, R_IN, ARC_START, ARC_START + ARC_SWEEP, currTrack);
-  lcd.fillCircle(CX + (int)(midR * cosf(startRad)), CY + (int)(midR * sinf(startRad)), (int)capR, currTrack);
-  lcd.fillCircle(CX + (int)(midR * cosf(endRad)),   CY + (int)(midR * sinf(endRad)),   (int)capR, currTrack);
-
-  // Complete solid fill — no breathing, no fade
-  float drawPct = dpct;
-  if (drawPct < 2.0f && usage.valid) drawPct = 2.0f;
-
-  if (dpct > 0.5f) {
-    float solidEnd = ARC_START + ARC_SWEEP * drawPct / 100.0f;
-    if (solidEnd > ARC_START + ARC_SWEEP) solidEnd = ARC_START + ARC_SWEEP;
-    lcd.fillArc(CX, CY, R_OUT, R_IN, ARC_START, solidEnd, currMeter);
-    lcd.fillCircle(
-      CX + (int)(midR * cosf(ARC_START * DEG_TO_RAD)),
-      CY + (int)(midR * sinf(ARC_START * DEG_TO_RAD)),
-      (int)capR, currMeter);
-    if (solidEnd < ARC_START + ARC_SWEEP - 2.0f) {
-      float endRad = solidEnd * DEG_TO_RAD;
-      lcd.fillCircle(CX + (int)(midR * cosf(endRad)), CY + (int)(midR * sinf(endRad)), (int)capR, currMeter);
-    }
-  }
-
-  // Breathing animation at the tip (25° window, runs every 200ms)
-  refreshArc();
+  drawArcAA();
 
   // Big number + %
   char numBuf[4]; snprintf(numBuf, 4, "%.0f", dpct);
@@ -831,25 +882,6 @@ static void drawSession() {
   lcd.setTextColor(currMeter, currBg);
   drawSpacedCentered(pctLabel(pct), CX, 155 - lcd.fontHeight() / 2, 2);
 
-  // Velocity arrow
-  int vel = usageVelocity();
-  if (vel != 0) {
-    int arrowY = 138;
-    uint16_t arrowColor = currMeter;
-    const int aw = 3, ah = 4;
-    if (vel > 0) {
-      lcd.drawLine(CX, arrowY - ah, CX - aw, arrowY, arrowColor);
-      lcd.drawLine(CX, arrowY - ah, CX + aw, arrowY, arrowColor);
-      lcd.drawLine(CX, arrowY - ah + 1, CX - aw, arrowY + 1, arrowColor);
-      lcd.drawLine(CX, arrowY - ah + 1, CX + aw, arrowY + 1, arrowColor);
-    } else {
-      lcd.drawLine(CX, arrowY + ah, CX - aw, arrowY, arrowColor);
-      lcd.drawLine(CX, arrowY + ah, CX + aw, arrowY, arrowColor);
-      lcd.drawLine(CX, arrowY + ah - 1, CX - aw, arrowY - 1, arrowColor);
-      lcd.drawLine(CX, arrowY + ah - 1, CX + aw, arrowY - 1, arrowColor);
-    }
-  }
-
   // "RESETS IN"
   const int resetsY = 183;
   lcd.setFont(&Montserrat14);
@@ -858,21 +890,7 @@ static void drawSession() {
 
   // Live countdown
   char countdownBuf[12];
-  bool timerExpired = false;
-  if (fiveHourResetEpoch > 0) {
-    time_t t; time(&t);
-    int remaining = (int)(fiveHourResetEpoch - t);
-    if (remaining <= 0) {
-      timerExpired = true;
-      strlcpy(countdownBuf, "--:--:--", sizeof(countdownBuf));
-    } else {
-      snprintf(countdownBuf, sizeof(countdownBuf), "%02d:%02d:%02d",
-               remaining / 3600, (remaining % 3600) / 60, remaining % 60);
-    }
-  } else {
-    timerExpired = true;
-    strlcpy(countdownBuf, "--:--:--", sizeof(countdownBuf));
-  }
+  bool timerExpired = formatCountdown(countdownBuf, sizeof(countdownBuf));
   lcd.setFont(&BebasNeue20);
   lcd.setTextDatum(MC_DATUM);
   lcd.setTextColor(timerExpired ? currLabel : 0xFFFF, currBg);
@@ -918,7 +936,10 @@ static void drawUsageChart(int x, int y, int w, int h) {
   if (numPoints < 2) numPoints = 2;
   float step = (float)(count - 1) / (float)(numPoints - 1);
 
-  static int16_t px[160], py[160];
+  static int16_t px[160];
+  static float   fyf[160];
+  static float   tmp[160];
+
   for (int p = 0; p < numPoints; p++) {
     float dataPos = p * step;
     int i0 = (int)dataPos;
@@ -927,39 +948,62 @@ static void drawUsageChart(int x, int y, int w, int h) {
     int ri0 = (historyChartIdx - count + i0 + HISTORY_MAX) % HISTORY_MAX;
     int ri1 = (historyChartIdx - count + i1 + HISTORY_MAX) % HISTORY_MAX;
     float val = usageHistoryChart[ri0] * (1.0f - frac) + usageHistoryChart[ri1] * frac;
-    px[p] = cx + (p * cw) / (numPoints - 1);
-    py[p] = cy + ch - (int)((val - minVal) / range * ch);
-    if (py[p] < cy) py[p] = cy;
-    if (py[p] > baseline) py[p] = baseline;
+    px[p]  = cx + (p * cw) / (numPoints - 1);
+    fyf[p] = cy + ch - ((val - minVal) / range * ch);
   }
 
-  // 4-pass moving average for smooth curves
-  for (int pass = 0; pass < 4; pass++) {
-    for (int p = 1; p < numPoints - 1; p++) {
-      py[p] = (py[p - 1] + py[p] + py[p + 1]) / 3;
-    }
+  // Smoothing — weighted [1 2 1] kernel, 6 passes, float precision
+  for (int pass = 0; pass < 6; pass++) {
+    tmp[0] = fyf[0];
+    tmp[numPoints - 1] = fyf[numPoints - 1];
+    for (int p = 1; p < numPoints - 1; p++)
+      tmp[p] = (fyf[p - 1] + 2.0f * fyf[p] + fyf[p + 1]) * 0.25f;
+    memcpy(fyf, tmp, sizeof(float) * numPoints);
   }
   for (int p = 0; p < numPoints; p++) {
-    if (py[p] < cy) py[p] = cy;
-    if (py[p] > baseline) py[p] = baseline;
+    if (fyf[p] < cy) fyf[p] = cy;
+    if (fyf[p] > baseline) fyf[p] = baseline;
   }
 
-  // Fill under the curve
   uint16_t fillColor = lerpColor(currTrack, currMeter, 0.45f);
-  for (int p = 0; p < numPoints; p++) {
-    if (py[p] < baseline)
-      lcd.drawLine(px[p], py[p], px[p], baseline, fillColor);
-  }
 
-  // 2px line on top
-  for (int p = 0; p < numPoints - 1; p++) {
-    lcd.drawLine(px[p], py[p],     px[p + 1], py[p + 1],     currMeter);
-    lcd.drawLine(px[p], py[p] + 1, px[p + 1], py[p + 1] + 1, currMeter);
+  // Per-column render with vertical anti-aliasing
+  for (int p = 0; p < numPoints; p++) {
+    int xx = px[p];
+    float fy  = fyf[p];
+    float fyN = (p + 1 < numPoints) ? fyf[p + 1] : fy;
+    float fyP = (p > 0)             ? fyf[p - 1] : fy;
+
+    // Connect to neighbors via midpoints so steep sections don't break up
+    float top = fminf(fy, fminf((fy + fyN) * 0.5f, (fy + fyP) * 0.5f));
+    float bot = fmaxf(fy, fmaxf((fy + fyN) * 0.5f, (fy + fyP) * 0.5f));
+    int itop = (int)floorf(top);
+    int ibot = (int)floorf(bot);
+    float fracTop = top - itop;
+    float fracBot = bot - ibot;
+
+    // Solid fill below the stroke
+    if (ibot + 1 <= baseline)
+      lcd.drawLine(xx, ibot + 1, xx, baseline, fillColor);
+
+    // Solid stroke core
+    if (ibot > itop)
+      lcd.drawLine(xx, itop + 1, xx, ibot, currMeter);
+
+    // Anti-aliased top edge — blend stroke into track by coverage
+    if (itop >= cy && itop <= baseline)
+      lcd.drawPixel(xx, itop, lerpColor(currTrack, currMeter, 1.0f - fracTop));
+
+    // Anti-aliased bottom edge — blend stroke into fill by coverage
+    if (ibot + 1 >= cy && ibot + 1 <= baseline)
+      lcd.drawPixel(xx, ibot + 1, lerpColor(fillColor, currMeter, fracBot));
   }
 
   // End dot
-  lcd.fillCircle(px[numPoints - 1], py[numPoints - 1], 3, currMeter);
-  lcd.fillCircle(px[numPoints - 1], py[numPoints - 1], 1, currBg);
+  int ex = px[numPoints - 1];
+  int ey = (int)fyf[numPoints - 1];
+  lcd.fillCircle(ex, ey, 3, currMeter);
+  lcd.fillCircle(ex, ey, 1, currBg);
 
   // Current value label — inside chart, top left
   lcd.setFont(&BebasNeue20);
@@ -971,7 +1015,7 @@ static void drawUsageChart(int x, int y, int w, int h) {
   lcd.drawString(nowStr, x + 4, y + 2);
 }
 
-static void drawWeekly() {
+static void drawUsage() {
   drawBackground();
   resetFont();
 
@@ -1016,7 +1060,7 @@ static void drawWeekly() {
   for (int i = 0; i < 3; i++) {
     char pctBuf[6]; snprintf(pctBuf, sizeof(pctBuf), "%.0f", rows[i].pct);
 
-    lcd.setFont(&BebasNeue22);
+    lcd.setFont(&BebasNeue20);
     lcd.setTextDatum(TR_DATUM);
     lcd.setTextColor(0xFFFF, currBg);
     lcd.drawString(pctBuf, W - 20, y);
@@ -1043,6 +1087,70 @@ static void drawWeekly() {
   }
 }
 
+static void drawConnection() {
+  drawBackground();
+  resetFont();
+
+  drawHeader("CONNECTION");
+
+  int y = CONTENT_TOP + 10;
+  const int step = 44;
+
+  // WIFI
+  lcd.setFont(&Montserrat14); lcd.setTextDatum(TL_DATUM); lcd.setTextColor(currLabel, currBg);
+  drawSpaced("WIFI", 8, y, 2);
+  lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
+  if (WiFi.status() == WL_CONNECTED) {
+    char ssidBuf[22];
+    snprintf(ssidBuf, sizeof(ssidBuf), "%s", WiFi.SSID().c_str());
+    lcd.drawString(ssidBuf, 8, y + 16);
+  } else {
+    lcd.drawString("Disconnected", 8, y + 16);
+  }
+  y += step;
+
+  // SIGNAL
+  lcd.setFont(&Montserrat14); lcd.setTextColor(currLabel, currBg);
+  drawSpaced("SIGNAL", 8, y, 2);
+  lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
+  if (WiFi.status() == WL_CONNECTED) {
+    char rssiBuf[16];
+    snprintf(rssiBuf, sizeof(rssiBuf), "%d dBm", (int)WiFi.RSSI());
+    lcd.drawString(rssiBuf, 8, y + 16);
+  } else {
+    lcd.drawString("--", 8, y + 16);
+  }
+  y += step;
+
+  // API
+  lcd.setFont(&Montserrat14); lcd.setTextColor(currLabel, currBg);
+  drawSpaced("API", 8, y, 2);
+  lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
+  {
+    char apiBuf[16];
+    if (usage.httpCode > 0) snprintf(apiBuf, sizeof(apiBuf), "%d", usage.httpCode);
+    else strlcpy(apiBuf, "--", sizeof(apiBuf));
+    lcd.drawString(apiBuf, 8, y + 16);
+  }
+  y += step;
+
+  // SYNC
+  lcd.setFont(&Montserrat14); lcd.setTextColor(currLabel, currBg);
+  drawSpaced("SYNC", 8, y, 2);
+  lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
+  {
+    char syncBuf[16];
+    if (usage.fetchedAt > 0) {
+      unsigned long secs = (millis() - usage.fetchedAt) / 1000;
+      if (secs < 60) snprintf(syncBuf, sizeof(syncBuf), "%lus ago", secs);
+      else           snprintf(syncBuf, sizeof(syncBuf), "%lum ago", secs / 60);
+    } else {
+      strlcpy(syncBuf, "never", sizeof(syncBuf));
+    }
+    lcd.drawString(syncBuf, 8, y + 16);
+  }
+}
+
 static void drawDevice() {
   drawBackground();
   resetFont();
@@ -1050,18 +1158,11 @@ static void drawDevice() {
   drawHeader("DEVICE");
 
   int y = CONTENT_TOP + 10;
-  const int rowH = 44;
-
-  // WIFI
-  lcd.setFont(&Montserrat14); lcd.setTextDatum(TL_DATUM); lcd.setTextColor(currLabel, currBg);
-  lcd.drawString("WIFI", 8, y);
-  lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
-  lcd.drawString(cfg.ssid, 8, y + 16);
-  y += rowH;
+  const int step = 50;
 
   // POWER — show raw voltage since M5PM1 percentage is unreliable
-  lcd.setFont(&Montserrat14); lcd.setTextColor(currLabel, currBg);
-  lcd.drawString("POWER", 8, y);
+  lcd.setFont(&Montserrat14); lcd.setTextDatum(TL_DATUM); lcd.setTextColor(currLabel, currBg);
+  drawSpaced("POWER", 8, y, 2);
   lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
   int32_t mv = M5.Power.getBatteryVoltage();
   bool charging = M5.Power.isCharging();
@@ -1072,29 +1173,33 @@ static void drawDevice() {
     snprintf(powerStr, sizeof(powerStr), "%dmV", (int)mv);
   }
   lcd.drawString(powerStr, 8, y + 16);
-  y += rowH;
+  y += step;
 
-  // SYNC
+  // TEMP
   lcd.setFont(&Montserrat14); lcd.setTextColor(currLabel, currBg);
-  lcd.drawString("SYNC", 8, y);
-  char syncStr[16];
-  if (usage.fetchedAt) {
-    uint32_t ago = (millis() - usage.fetchedAt) / 1000;
-    if (ago < 60) snprintf(syncStr, sizeof(syncStr), "%lus ago", (unsigned long)ago);
-    else          snprintf(syncStr, sizeof(syncStr), "%lum ago", (unsigned long)(ago / 60));
-  } else strlcpy(syncStr, "Never", sizeof(syncStr));
+  drawSpaced("TEMP", 8, y, 2);
   lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
-  lcd.drawString(syncStr, 8, y + 16);
-  y += rowH;
+  {
+    float tc = temperatureRead();
+    char tempBuf[20];
+    snprintf(tempBuf, sizeof(tempBuf), "%.0fF / %.0fC", tc * 9.0f / 5.0f + 32.0f, tc);
+    lcd.drawString(tempBuf, 8, y + 16);
+  }
+  y += step;
 
-  // API
+  // UPTIME
   lcd.setFont(&Montserrat14); lcd.setTextColor(currLabel, currBg);
-  lcd.drawString("API", 8, y);
-  char apiStr[8]; snprintf(apiStr, sizeof(apiStr), "%d", usage.httpCode);
+  drawSpaced("UPTIME", 8, y, 2);
   lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
-  lcd.drawString(usage.httpCode ? apiStr : "N/A", 8, y + 16);
-  y += rowH; (void)y;
-
+  {
+    char upBuf[16];
+    unsigned long up = millis() / 1000;
+    unsigned long d = up / 86400, h = (up % 86400) / 3600, m = (up % 3600) / 60;
+    if (d > 0)      snprintf(upBuf, sizeof(upBuf), "%lud %luh", d, h);
+    else if (h > 0) snprintf(upBuf, sizeof(upBuf), "%luh %lum", h, m);
+    else            snprintf(upBuf, sizeof(upBuf), "%lum", m);
+    lcd.drawString(upBuf, 8, y + 16);
+  }
 }
 
 static void drawKeyStatus() {
@@ -1103,7 +1208,7 @@ static void drawKeyStatus() {
 
   drawHeader("KEY");
 
-  int y = CONTENT_TOP + 15;
+  int y = CONTENT_TOP + 10;
 
   time_t t; time(&t);
   int ageDays = 0, ageHours = 0;
@@ -1118,28 +1223,28 @@ static void drawKeyStatus() {
 
   lcd.setFont(&Montserrat14);
   lcd.setTextColor(currLabel, currBg);
-  lcd.drawString("STATUS", 8, y);
+  drawSpaced("STATUS", 8, y, 2);
   lcd.setFont(&BebasNeue20);
   lcd.setTextColor(0xFFFF, currBg);
-  if (keyExpired)     lcd.drawString("EXPIRED", 8, y + 18);
-  else if (keyValid)  lcd.drawString("ACTIVE",  8, y + 18);
-  else                lcd.drawString("UNKNOWN", 8, y + 18);
+  if (keyExpired)     lcd.drawString("EXPIRED", 8, y + 16);
+  else if (keyValid)  lcd.drawString("ACTIVE",  8, y + 16);
+  else                lcd.drawString("UNKNOWN", 8, y + 16);
   y += 50;
 
   lcd.setFont(&Montserrat14);
   lcd.setTextColor(currLabel, currBg);
-  lcd.drawString("AGE", 8, y);
+  drawSpaced("AGE", 8, y, 2);
   char ageStr[16];
   snprintf(ageStr, sizeof(ageStr), "%dD %dH", ageDays, ageHours);
   lcd.setFont(&BebasNeue20);
   lcd.setTextColor(0xFFFF, currBg);
-  lcd.drawString(ageStr, 8, y + 18);
+  lcd.drawString(ageStr, 8, y + 16);
   y += 50;
 
   // Estimated expiry date — session keys last ~14 days
   lcd.setFont(&Montserrat14);
   lcd.setTextColor(currLabel, currBg);
-  lcd.drawString("EXPIRES", 8, y);
+  drawSpaced("EXPIRES", 8, y, 2);
 
   if (keySetEpoch > 0) {
     time_t expiryEpoch = (time_t)keySetEpoch + (14 * 86400);
@@ -1156,12 +1261,12 @@ static void drawKeyStatus() {
     if (daysLeft <= 2)      lcd.setTextColor(0xF800, currBg);
     else if (daysLeft <= 5) lcd.setTextColor(0xFCA0, currBg);
     else                    lcd.setTextColor(0xFFFF, currBg);
-    lcd.drawString(expiryStr, 8, y + 18);
+    lcd.drawString(expiryStr, 8, y + 16);
 
   } else {
     lcd.setFont(&BebasNeue20);
     lcd.setTextColor(0xFFFF, currBg);
-    lcd.drawString("UNKNOWN", 8, y + 18);
+    lcd.drawString("UNKNOWN", 8, y + 16);
   }
 
 }
@@ -1169,35 +1274,13 @@ static void drawKeyStatus() {
 static void drawSessionLandscape() {
   drawBackground();
 
-  const int CX = 68, CY = H_L / 2;
-  const int R_OUT = 50, R_IN = 42;
-  const float ARC_START = 150.0f, ARC_SWEEP = 240.0f;
-  float midR = (R_OUT + R_IN) / 2.0f;
-  float capR = (R_OUT - R_IN) / 2.0f;
-  float startRad = ARC_START * DEG_TO_RAD;
-  float endRad   = (ARC_START + ARC_SWEEP) * DEG_TO_RAD;
+  if (keyExpired) { drawExpiredNotice(); drawSyncIcon(); return; }
 
+  const int CX = 68, CY = H_L / 2;
   float dpct = displayedPct;
   float pct  = usage.valid ? usage.fiveHour.pct : 0;
 
-
-  // Track arc + round caps
-  lcd.fillArc(CX, CY, R_OUT, R_IN, ARC_START, ARC_START + ARC_SWEEP, currTrack);
-  lcd.fillCircle(CX + (int)(midR * cosf(startRad)), CY + (int)(midR * sinf(startRad)), (int)capR, currTrack);
-  lcd.fillCircle(CX + (int)(midR * cosf(endRad)),   CY + (int)(midR * sinf(endRad)),   (int)capR, currTrack);
-
-  if (usage.valid && dpct > 0.5f) {
-    float drawPct = dpct;
-    if (drawPct < 2.0f) drawPct = 2.0f;
-    float solidEnd = ARC_START + ARC_SWEEP * drawPct / 100.0f;
-    if (solidEnd > ARC_START + ARC_SWEEP) solidEnd = ARC_START + ARC_SWEEP;
-    lcd.fillArc(CX, CY, R_OUT, R_IN, ARC_START, solidEnd, currMeter);
-    lcd.fillCircle(CX + (int)(midR * cosf(startRad)), CY + (int)(midR * sinf(startRad)), (int)capR, currMeter);
-    if (solidEnd < ARC_START + ARC_SWEEP - 2.0f) {
-      float solidEndRad = solidEnd * DEG_TO_RAD;
-      lcd.fillCircle(CX + (int)(midR * cosf(solidEndRad)), CY + (int)(midR * sinf(solidEndRad)), (int)capR, currMeter);
-    }
-  }
+  drawArcAALandscape();
 
   if (usage.valid) {
     char numBuf[4]; snprintf(numBuf, 4, "%.0f", dpct);
@@ -1227,151 +1310,98 @@ static void drawSessionLandscape() {
     lcd.setTextDatum(TL_DATUM);
   }
 
-  // Right panel — timer
+  // Right panel — vertically centered to the display
   int rightX = 140;
+
+  // Compute countdown value
+  char countdownBuf[12];
+  bool timerExpired = formatCountdown(countdownBuf, sizeof(countdownBuf));
+
+  // Measure fonts to center the lockup
+  lcd.setFont(&BebasNeue44);
+  int availW = W_L - rightX - 8;
+  bool useSmallTimer = (lcd.textWidth(countdownBuf) > availW);
+  if (useSmallTimer) lcd.setFont(&BebasNeue22);
+  int timerH = lcd.fontHeight();
+
   lcd.setFont(&Montserrat14);
+  int labelH = lcd.fontHeight();
+
+  int gap = 8;
+  int totalH = labelH + gap + timerH;
+  int topY = (H_L - totalH) / 2;
+  landscapeTimerY = topY + labelH + gap;
+
+  // Draw label
   lcd.setTextColor(currLabel, currBg);
   lcd.setTextDatum(TL_DATUM);
-  drawSpaced("RESETS IN", rightX, 40, 1);
+  drawSpaced("RESETS IN", rightX, topY, 2);
 
-  char countdownBuf[12];
-  bool timerExpired = false;
-  if (fiveHourResetEpoch > 0) {
-    time_t t; time(&t);
-    int remaining = (int)(fiveHourResetEpoch - t);
-    if (remaining <= 0) {
-      timerExpired = true;
-      strlcpy(countdownBuf, "--:--:--", sizeof(countdownBuf));
-    } else {
-      snprintf(countdownBuf, sizeof(countdownBuf), "%02d:%02d:%02d",
-               remaining / 3600, (remaining % 3600) / 60, remaining % 60);
-    }
-  } else {
-    timerExpired = true;
-    strlcpy(countdownBuf, "--:--:--", sizeof(countdownBuf));
-  }
-  lcd.setFont(&BebasNeue44);
-  int timerW = lcd.textWidth(countdownBuf);
-  int availW = W_L - rightX - 8;
-  if (timerW > availW) lcd.setFont(&BebasNeue22);
+  // Draw timer
+  lcd.setFont(useSmallTimer ? &BebasNeue22 : &BebasNeue44);
   lcd.setTextDatum(TL_DATUM);
   lcd.setTextColor(timerExpired ? currLabel : 0xFFFF, currBg);
-  lcd.drawString(countdownBuf, rightX, 60);
+  lcd.drawString(countdownBuf, rightX, landscapeTimerY);
 
-  // Velocity arrow — below status label
-  int vel = usageVelocity();
-  if (vel != 0) {
-    int arrowX = CX, arrowY = CY + 52;
-    const int aw = 3, ah = 4;
-    if (vel > 0) {
-      lcd.drawLine(arrowX, arrowY - ah, arrowX - aw, arrowY, currMeter);
-      lcd.drawLine(arrowX, arrowY - ah, arrowX + aw, arrowY, currMeter);
-      lcd.drawLine(arrowX, arrowY - ah + 1, arrowX - aw, arrowY + 1, currMeter);
-      lcd.drawLine(arrowX, arrowY - ah + 1, arrowX + aw, arrowY + 1, currMeter);
-    } else {
-      lcd.drawLine(arrowX, arrowY + ah, arrowX - aw, arrowY, currMeter);
-      lcd.drawLine(arrowX, arrowY + ah, arrowX + aw, arrowY, currMeter);
-      lcd.drawLine(arrowX, arrowY + ah - 1, arrowX - aw, arrowY - 1, currMeter);
-      lcd.drawLine(arrowX, arrowY + ah - 1, arrowX + aw, arrowY - 1, currMeter);
-    }
-  }
+  drawSyncIcon();
   lcd.setTextDatum(TL_DATUM);
-}
-
-static void refreshArcLandscape() {
-  if (!usage.valid || !isLandscape) return;
-
-  float dpct = displayedPct;
-  if (dpct < 0.1f) {
-    const int CX = 68, CY = H_L / 2;
-    const int R_OUT = 50, R_IN = 42;
-    lcd.fillArc(CX, CY, R_OUT, R_IN, 150.0f, 390.0f, currTrack);
-    lcd.setFont(&BebasNeue44);
-    lcd.setTextDatum(MC_DATUM);
-    lcd.setTextColor(currMeter, currBg);
-    lcd.drawString("0%", CX, CY);
-    lcd.setTextDatum(TL_DATUM);
-    return;
-  }
-
-  // Alert flash — red pulse when usage > 80%
-  uint16_t arcColor = currMeter;
-  bool alertFlash = false;
-  if (usage.fiveHour.pct > 80.0f) {
-    int cycle = (int)(millis() % 2000);
-    alertFlash = (cycle < 400);
-    if (alertFlash) arcColor = 0xF800;
-  }
-
-  const int CX = 68, CY = H_L / 2;
-  const int R_OUT = 50, R_IN = 42;
-  const float ARC_START = 150.0f, ARC_SWEEP = 240.0f;
-  const float ARC_MAX = ARC_START + ARC_SWEEP;
-  float midR = (R_OUT + R_IN) / 2.0f;
-  float capR = (R_OUT - R_IN) / 2.0f;
-
-  float drawPct = dpct;
-  if (drawPct < 2.0f) drawPct = 2.0f;
-  float baseEnd = ARC_START + ARC_SWEEP * drawPct / 100.0f;
-  if (baseEnd > ARC_MAX) baseEnd = ARC_MAX;
-
-  float animEnd = baseEnd + sinf(breathPhase) * 4.0f;
-  if (animEnd < ARC_START + 2.0f) animEnd = ARC_START + 2.0f;
-  if (animEnd > ARC_MAX) animEnd = ARC_MAX;
-
-  float deepEnd = baseEnd + 12.0f + sinf(breathPhase * 0.65f) * 10.0f
-                + sinf(breathPhase * 0.28f) * 5.0f
-                + sinf(breathPhase * 0.15f) * 3.0f;
-  if (deepEnd > ARC_MAX) deepEnd = ARC_MAX;
-
-  float medEnd = baseEnd + 5.0f + sinf(breathPhase * 0.8f) * 6.0f
-               + sinf(breathPhase * 0.35f) * 3.0f;
-  if (medEnd > ARC_MAX) medEnd = ARC_MAX;
-
-  float furthest = fmaxf(animEnd, fmaxf(deepEnd, medEnd));
-  float trackEnd = baseEnd + 30.0f;
-  if (trackEnd > ARC_MAX) trackEnd = ARC_MAX;
-  if (furthest < trackEnd)
-    lcd.fillArc(CX, CY, R_OUT, R_IN, furthest, trackEnd, currTrack);
-
-  if (deepEnd > animEnd)
-    lcd.fillArc(CX, CY, R_OUT, R_IN, animEnd, deepEnd, lerpColor(currBg, arcColor, 0.35f));
-
-  if (medEnd > animEnd)
-    lcd.fillArc(CX, CY, R_OUT, R_IN, animEnd, medEnd, lerpColor(currBg, arcColor, 0.55f));
-
-  float fillStart = baseEnd - 10.0f;
-  if (fillStart < ARC_START) fillStart = ARC_START;
-  if (animEnd > fillStart) {
-    lcd.fillArc(CX, CY, R_OUT, R_IN, fillStart, animEnd, arcColor);
-    if (animEnd < ARC_MAX - 2.0f) {
-      float endRad = animEnd * DEG_TO_RAD;
-      lcd.fillCircle(CX + (int)(midR * cosf(endRad)), CY + (int)(midR * sinf(endRad)), (int)capR, arcColor);
-    }
-  }
 }
 
 static void refreshTimerLandscape() {
   if (!usage.valid || !isLandscape) return;
-  if (fiveHourResetEpoch <= 0) return;
+
+  char countdownBuf[12];
+  bool expired = formatCountdown(countdownBuf, sizeof(countdownBuf));
 
   int rightX = 140;
-  time_t t; time(&t);
-  int remaining = (int)(fiveHourResetEpoch - t);
-  char countdownBuf[12];
-  bool expired = (remaining <= 0);
-  if (expired) strlcpy(countdownBuf, "--:--:--", sizeof(countdownBuf));
-  else snprintf(countdownBuf, sizeof(countdownBuf), "%02d:%02d:%02d",
-                remaining / 3600, (remaining % 3600) / 60, remaining % 60);
-
   lcd.setFont(&BebasNeue44);
   int availW = W_L - rightX - 8;
   if (lcd.textWidth(countdownBuf) > availW) lcd.setFont(&BebasNeue22);
   lcd.setTextDatum(TL_DATUM);
   lcd.setTextColor(expired ? currLabel : 0xFFFF, currBg);
-  lcd.fillRect(rightX, 58, availW, lcd.fontHeight() + 4, currBg);
-  lcd.drawString(countdownBuf, rightX, 60);
+  lcd.drawString(countdownBuf, rightX, landscapeTimerY);
   lcd.setTextDatum(TL_DATUM);
+}
+
+static void drawScreen();  // forward declaration — defined immediately below
+
+static void drawScreenBuffered() {
+  int sw = isLandscape ? W_L : W;
+  int sh = isLandscape ? H_L : H;
+  M5Canvas frame(&M5.Display);
+  frame.setColorDepth(16);
+  frame.setPsram(true);
+  if (frame.createSprite(sw, sh)) {
+    _gfx = &frame;
+    drawScreen();
+    _gfx = &M5.Display;
+    frame.pushSprite(0, 0);
+    frame.deleteSprite();
+  } else {
+    drawScreen();
+  }
+}
+
+static void animatePctTo(float target) {
+  float start = displayedPct;
+
+  // No meaningful change — just settle and draw once
+  if (fabsf(target - start) < 0.5f) {
+    displayedPct = target;
+    drawScreenBuffered();
+    return;
+  }
+
+  const int frames = 14;
+  for (int f = 1; f <= frames; f++) {
+    float t = (float)f / frames;
+    float e = 1.0f - powf(1.0f - t, 3.0f);   // ease-out cubic — quick start, soft settle
+    displayedPct = start + (target - start) * e;
+    drawScreenBuffered();
+    delay(16);
+  }
+  displayedPct = target;
+  drawScreenBuffered();
 }
 
 static void drawScreen() {
@@ -1379,13 +1409,74 @@ static void drawScreen() {
     drawSessionLandscape();
   } else {
     switch (currentScreen) {
-      case SCR_SESSION: drawSession();    break;
-      case SCR_WEEKLY:  drawWeekly();     break;
-      case SCR_DEVICE:  drawDevice();     break;
-      case SCR_KEY:     drawKeyStatus();  break;
+      case SCR_SESSION:    drawSession();    break;
+      case SCR_USAGE:      drawUsage();      break;
+      case SCR_CONNECTION: drawConnection(); break;
+      case SCR_DEVICE:     drawDevice();     break;
+      case SCR_KEY:        drawKeyStatus();  break;
     }
   }
   yield();
+}
+
+static void drawRelaxFrame();  // forward declaration — defined after slideTransition
+
+static void themeTransition(uint8_t fromIdx, uint8_t toIdx) {
+  int sw = isLandscape ? W_L : W;
+  int sh = isLandscape ? H_L : H;
+
+  uint16_t fM = THEMES[fromIdx].meter,  tM = THEMES[toIdx].meter;
+  uint16_t fL = THEMES[fromIdx].label,  tL = THEMES[toIdx].label;
+  uint16_t fT = THEMES[fromIdx].track,  tT = THEMES[toIdx].track;
+  uint16_t fB = THEMES[fromIdx].bg,     tB = THEMES[toIdx].bg;
+
+  bool relaxActive = usageIdle && (isLandscape || currentScreen == SCR_SESSION);
+
+  M5Canvas frame(&M5.Display);
+  bool useSprite = false;
+  if (!relaxActive) {
+    frame.setColorDepth(16);
+    frame.setPsram(true);
+    useSprite = frame.createSprite(sw, sh);
+  }
+
+  const int steps = 10;
+  for (int s = 1; s <= steps; s++) {
+    float t = (float)s / steps;
+    float e;
+    if (t < 0.5f) e = 4.0f * t * t * t;
+    else { float p = -2.0f * t + 2.0f; e = 1.0f - (p * p * p) / 2.0f; }
+
+    currMeter  = lerpColor(fM, tM, e);
+    currLabel  = lerpColor(fL, tL, e);
+    currTrack  = lerpColor(fT, tT, e);
+    currBg     = lerpColor(fB, tB, e);
+
+    if (relaxActive) {
+      drawRelaxFrame();
+    } else if (useSprite) {
+      _gfx = &frame;
+      drawScreen();
+      _gfx = &M5.Display;
+      frame.pushSprite(0, 0);
+    } else {
+      drawScreen();
+    }
+    delay(18);
+  }
+
+  currMeter = tM; currLabel = tL; currTrack = tT; currBg = tB;
+  if (relaxActive) {
+    drawRelaxFrame();
+  } else if (useSprite) {
+    _gfx = &frame;
+    drawScreen();
+    _gfx = &M5.Display;
+    frame.pushSprite(0, 0);
+    frame.deleteSprite();
+  } else {
+    drawScreen();
+  }
 }
 
 static void slideTransition() {
@@ -1484,40 +1575,68 @@ static void rotateTransition(int oldRot, int newRot) {
   drawScreen();
 }
 
+static void freeRelaxCanvas() {
+  if (relaxCanvas) {
+    relaxCanvas->deleteSprite();
+    delete relaxCanvas;
+    relaxCanvas = nullptr;
+    relaxCanvasW = 0;
+    relaxCanvasH = 0;
+  }
+}
+
 static void drawRelaxFrame() {
   int sw = isLandscape ? W_L : W;
   int sh = isLandscape ? H_L : H;
 
-  lcd.fillRect(0, 0, sw, sh, currBg);
+  // Persistent off-screen canvas — composed fully then pushed once (no flicker)
+  if (relaxCanvas == nullptr || relaxCanvasW != sw || relaxCanvasH != sh) {
+    freeRelaxCanvas();
+    relaxCanvas = new M5Canvas(&M5.Display);
+    relaxCanvas->setColorDepth(16);
+    relaxCanvas->setPsram(true);
+    if (!relaxCanvas->createSprite(sw, sh)) {
+      delete relaxCanvas; relaxCanvas = nullptr;
+      return;
+    }
+    relaxCanvasW = sw; relaxCanvasH = sh;
+    relaxBaseX = 20;
+    relaxBaseY = sh / 2.0f - 22;
+  }
+  M5Canvas& cv = *relaxCanvas;
+
+  // Background + dots
+  cv.fillRect(0, 0, sw, sh, currBg);
   uint16_t dotColor = lerpColor(currBg, currLabel, 0.25f);
   const int spacing = 18;
-  for (int y = spacing; y < sh; y += spacing)
-    for (int x = spacing; x < sw; x += spacing) {
-      lcd.drawPixel(x, y, dotColor);
-      lcd.drawPixel(x + 1, y, dotColor);
-      lcd.drawPixel(x, y + 1, dotColor);
-      lcd.drawPixel(x + 1, y + 1, dotColor);
+
+  relaxDriftOX += relaxDriftVX;
+  relaxDriftOY += relaxDriftVY;
+  int offX = (int)relaxDriftOX % spacing; if (offX < 0) offX += spacing;
+  int offY = (int)relaxDriftOY % spacing; if (offY < 0) offY += spacing;
+
+  for (int y = offY; y < sh; y += spacing)
+    for (int x = offX; x < sw; x += spacing) {
+      cv.drawPixel(x, y, dotColor);
+      cv.drawPixel(x + 1, y, dotColor);
+      cv.drawPixel(x, y + 1, dotColor);
+      cv.drawPixel(x + 1, y + 1, dotColor);
     }
 
-  // Advance phase
   relaxPhase += 0.08f;
-
-  // Drift the word
   relaxBaseX += relaxVelX;
   relaxBaseY += relaxVelY;
 
-  // Measure word width
-  lcd.setFont(&BebasNeue44);
+  cv.setFont(&BebasNeue44);
   const char* text = "RELAX";
   int wordW = 0;
   for (int i = 0; text[i]; i++) {
     char ch[2] = {text[i], 0};
-    wordW += lcd.textWidth(ch) + 3;
+    wordW += cv.textWidth(ch) + 3;
   }
-  int fontH = lcd.fontHeight();
+  int fontH = cv.fontHeight();
   int bobRange = 10;
 
-  // Bounce off edges
   if (relaxBaseX < 4 || relaxBaseX + wordW > sw - 4) {
     relaxVelX = -relaxVelX;
     relaxBaseX += relaxVelX * 2;
@@ -1527,28 +1646,27 @@ static void drawRelaxFrame() {
     relaxBaseY += relaxVelY * 2;
   }
 
-  // Draw each letter with independent vertical bob
-  lcd.setFont(&BebasNeue44);
-  lcd.setTextDatum(TL_DATUM);
-
+  cv.setFont(&BebasNeue44);
+  cv.setTextDatum(TL_DATUM);
   float cx = relaxBaseX;
   for (int i = 0; text[i]; i++) {
     char ch[2] = {text[i], 0};
     float bob = sinf(relaxPhase + i * 0.9f) * bobRange;
-    // Subtle color variation per letter
     float colorShift = sinf(relaxPhase * 0.5f + i * 0.6f) * 0.15f + 0.85f;
     uint16_t letterColor = lerpColor(currBg, currMeter, colorShift);
-    lcd.setTextColor(letterColor, currBg);
-    lcd.drawString(ch, (int)cx, (int)(relaxBaseY + bob));
-    cx += lcd.textWidth(ch) + 3;
+    cv.setTextColor(letterColor, currBg);
+    cv.drawString(ch, (int)cx, (int)(relaxBaseY + bob));
+    cx += cv.textWidth(ch) + 3;
   }
 
-  // Small "idle" indicator
-  lcd.setFont(&Montserrat11);
-  lcd.setTextDatum(MC_DATUM);
-  lcd.setTextColor(lerpColor(currBg, currLabel, 0.4f), currBg);
-  lcd.drawString("usage idle", sw / 2, sh - 14);
-  lcd.setTextDatum(TL_DATUM);
+  cv.setFont(&Montserrat11);
+  cv.setTextDatum(MC_DATUM);
+  cv.setTextColor(lerpColor(currBg, currLabel, 0.4f), currBg);
+  cv.drawString("usage idle", sw / 2, sh - 14);
+  cv.setTextDatum(TL_DATUM);
+
+  // Push the whole composed frame in one shot — no visible clear/redraw
+  cv.pushSprite(0, 0);
 }
 
 // ──────────── Captive Portal UI ────────────
@@ -1561,25 +1679,25 @@ static void drawSetupScreen(const char* statusText) {
   const int rowH = 44;
 
   lcd.setFont(&Montserrat14); lcd.setTextDatum(TL_DATUM); lcd.setTextColor(currLabel, currBg);
-  lcd.drawString("NETWORK", 8, y);
+  drawSpaced("NETWORK", 8, y, 2);
   lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
   lcd.drawString("claude usage", 8, y + 16);
   y += rowH;
 
   lcd.setFont(&Montserrat14); lcd.setTextColor(currLabel, currBg);
-  lcd.drawString("IP ADDRESS", 8, y);
+  drawSpaced("IP ADDRESS", 8, y, 2);
   lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
   lcd.drawString("192.168.4.1", 8, y + 16);
   y += rowH;
 
-  lcd.setFont(&Montserrat11); lcd.setTextColor(currLabel, currBg);
-  drawSpaced("PASSWORD", 8, y, 1);
+  lcd.setFont(&Montserrat14); lcd.setTextColor(currLabel, currBg);
+  drawSpaced("PASSWORD", 8, y, 2);
   lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
-  lcd.drawString(apPassword, 8, y + 14);
+  lcd.drawString(apPassword, 8, y + 16);
   y += rowH;
 
   lcd.setFont(&Montserrat14); lcd.setTextColor(currLabel, currBg);
-  lcd.drawString("CONFIG", 8, y);
+  drawSpaced("CONFIG", 8, y, 2);
   lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
   lcd.drawString(statusText, 8, y + 16);
 }
@@ -1593,19 +1711,19 @@ static void drawSetupSuccess() {
   const int rowH = 44;
 
   lcd.setFont(&Montserrat14); lcd.setTextDatum(TL_DATUM); lcd.setTextColor(currLabel, currBg);
-  lcd.drawString("STATUS", 8, y);
+  drawSpaced("STATUS", 8, y, 2);
   lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
   lcd.drawString("CONNECTED", 8, y + 16);
   y += rowH;
 
   lcd.setFont(&Montserrat14); lcd.setTextColor(currLabel, currBg);
-  lcd.drawString("NETWORK", 8, y);
+  drawSpaced("NETWORK", 8, y, 2);
   lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
   lcd.drawString(nvs_ssid.c_str(), 8, y + 16);
   y += rowH;
 
   lcd.setFont(&Montserrat14); lcd.setTextColor(currLabel, currBg);
-  lcd.drawString("ACTION", 8, y);
+  drawSpaced("ACTION", 8, y, 2);
   lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
   lcd.drawString("RESTARTING...", 8, y + 16);
 }
@@ -1703,6 +1821,7 @@ void setup() {
 
   auto c = M5.config();
   M5.begin(c);
+  setCpuFrequencyMhz(160);  // 160 MHz is plenty for this workload; saves power + heat
   M5.Display.setRotation(0);
   M5.Display.setBrightness(nightMode ? 20 : 140);
   M5.Display.startWrite();  // hold SPI bus permanently
@@ -1710,7 +1829,6 @@ void setup() {
   M5.Speaker.begin();
   M5.Speaker.setVolume(DEFAULT_VOLUME);
   if (M5.Imu.isEnabled()) Serial.println("[imu] enabled — tilt to refresh active");
-  updateBattery();
 
   configLoad();
   loadChartHistory();
@@ -1738,7 +1856,6 @@ void setup() {
   }
 
   currMeter  = THEMES[themeIdx].meter;
-  currNumber = THEMES[themeIdx].number;
   currLabel  = THEMES[themeIdx].label;
   currTrack  = THEMES[themeIdx].track;
   currBg     = THEMES[themeIdx].bg;
@@ -1751,6 +1868,10 @@ void setup() {
   lcd.setTextColor(currMeter, currBg);
   lcd.drawString("CLAUDE", W / 2, H / 2 - 20);
   lcd.drawString("USAGE", W / 2, H / 2 + 24);
+  lcd.setFont(&Montserrat11);
+  lcd.setTextDatum(MC_DATUM);
+  lcd.setTextColor(lerpColor(currBg, currLabel, 0.3f), currBg);
+  lcd.drawString("v" FIRMWARE_VERSION, W / 2, H / 2 + 52);
   lcd.setTextDatum(TL_DATUM);
   for (int b = 0; b <= 7; b++) {
     M5.Display.setBrightness(b * 20);
@@ -1792,7 +1913,7 @@ void loop() {
     if (!configReceived && millis() - lastDotsUpdate > 500) {
       lastDotsUpdate = millis();
       dotCount = (dotCount + 1) % 4;
-      int y = CONTENT_TOP + 10 + 44 * 2;
+      int y = CONTENT_TOP + 10 + 44 * 3;
       lcd.setFont(&BebasNeue20);
       lcd.setTextDatum(TL_DATUM);
       lcd.setTextColor(0xFFFF, currBg);
@@ -1828,22 +1949,17 @@ void loop() {
     return;
   }
 
-  // Battery — sample every 2s
-  if (now - lastBatUpdateMs > 2000) {
-    lastBatUpdateMs = now;
-    updateBattery();
-  }
-
   // Breathing phase advances but does NOT trigger redraws
   breathPhase += 0.025f;  // ~3.2 second full cycle at 20ms loop
   if (breathPhase > 6.2832f) breathPhase -= 6.2832f;
 
   // Periodic fetch
-  if (!fetching && (lastFetchMs == 0 || now - lastFetchMs >= FETCH_INTERVAL)) {
+  if (!fetching && (lastFetchMs == 0 || now - lastFetchMs >= getFetchInterval())) {
     if (usage.fetchedAt > 0) drawSyncIndicator();
     fetchUsage();
+    float pctTarget = displayedPct;
     if (usage.valid) {
-      displayedPct       = usage.fiveHour.pct;
+      pctTarget          = usage.fiveHour.pct;   // animate to this
       displayedWeeklyPct = usage.weekly.pct;
       displayedSonnetPct = usage.sonnet.pct;
       displayedDesignPct = usage.design.pct;
@@ -1855,17 +1971,30 @@ void loop() {
       } else {
         idleFetchCount = 0;
         usageIdle = false;
+        freeRelaxCanvas();
       }
       lastIdlePct = usage.fiveHour.pct;
-      if (idleFetchCount >= 3 && !usageIdle) {
+      if (idleFetchCount >= 2 && !usageIdle) {
         usageIdle = true;
         relaxBaseX = 20;
         relaxBaseY = 80;
         relaxPhase = 0;
+        float driftAng = (float)(esp_random() % 360) * DEG_TO_RAD;
+        relaxDriftVX = cosf(driftAng) * 0.4f;   // random direction, gentle speed
+        relaxDriftVY = sinf(driftAng) * 0.4f;
+        relaxDriftOX = 0;
+        relaxDriftOY = 0;
         Serial.println("[idle] relax mode activated");
       }
     }
-    drawScreen();
+    if (usageIdle && (isLandscape || currentScreen == SCR_SESSION)) {
+      displayedPct = pctTarget;                 // relax is showing — keep value in sync, don't redraw
+    } else if (usage.valid && !keyExpired && (isLandscape || currentScreen == SCR_SESSION)) {
+      animatePctTo(pctTarget);                  // sweep the arc + number to the new value
+    } else {
+      displayedPct = pctTarget;
+      drawScreenBuffered();
+    }
     lastShakeRefresh = millis();  // block shakes after any fetch
     orientCooldown = millis() + 3000;
   }
@@ -1876,6 +2005,7 @@ void loop() {
     lastBtnA = now;
     usageIdle = false;
     idleFetchCount = 0;
+    freeRelaxCanvas();
     if (!isLandscape) {
       currentScreen = (currentScreen + 1) % SCR_COUNT;
       Serial.printf("[btn] screen %d\n", currentScreen + 1);
@@ -1939,28 +2069,28 @@ void loop() {
   }
   if (bCount == 2 && now - bLastMs > 100) {
     bCount = 0;
+    uint8_t oldIdx = themeIdx;
     themeIdx = (themeIdx + 1) % THEME_COUNT;
-    currMeter = theme().meter; currNumber = theme().number;
-    currLabel = theme().label; currTrack = theme().track; currBg = theme().bg;
-    themeSaveAt = now + 5000;
-    drawScreen();
     M5.Speaker.tone(2200, 15);
     delay(30);
     M5.Speaker.tone(2600, 15);
+    themeTransition(oldIdx, themeIdx);
+    themeSaveAt = now + 5000;
     Serial.printf("[theme] %s\n", theme().name);
   }
-  if (bCount == 1 && now - bLastMs > 400) {
+  if (bCount == 1 && now - bLastMs > 400 && !M5.BtnB.isPressed()) {
     bCount = 0;
     usageIdle = false;
     idleFetchCount = 0;
+    freeRelaxCanvas();
     M5.Speaker.tone(2000, 10);
-    drawSyncIndicator();
     lastFetchMs = 0;
   }
   // Hold B 2s: toggle night mode
   static bool btnBLong = false;
   if (M5.BtnB.pressedFor(2000) && !btnBLong) {
     btnBLong = true;
+    bCount = 0;  // cancel pending single-press refresh
     nightMode = !nightMode;
     M5.Display.setBrightness(nightMode ? 20 : 140);
     M5.Speaker.tone(nightMode ? 1400 : 2200, 15);
@@ -1985,29 +2115,31 @@ void loop() {
 
   // Relax mode animation — overrides normal session display when idle
   static uint32_t lastRelaxFrame = 0;
-  if (usageIdle && !isLandscape && currentScreen == SCR_SESSION && now - lastRelaxFrame > 80) {
+  if (usageIdle && now - lastRelaxFrame > 80 && (isLandscape || currentScreen == SCR_SESSION)) {
     lastRelaxFrame = now;
     drawRelaxFrame();
   }
 
   // Breathing animation — partial arc redraw
   static uint32_t lastBreathRedraw = 0;
-  if (!usageIdle && usage.valid && now - lastBreathRedraw > 120) {
+  if (!usageIdle && usage.valid && !keyExpired && now - lastBreathRedraw > 120) {
     if (isLandscape) {
       lastBreathRedraw = now;
-      refreshArcLandscape();
+      drawArcAALandscape();
+      drawSyncIcon();
     } else if (currentScreen == SCR_SESSION) {
       lastBreathRedraw = now;
-      refreshArc();
+      drawArcAA();
     }
   }
 
   // Countdown timer — update every second
   static uint32_t lastTimerUpdate = 0;
-  if (!usageIdle && usage.valid && now - lastTimerUpdate > 1000) {
+  if (!usageIdle && usage.valid && !keyExpired && now - lastTimerUpdate > 1000) {
     if (isLandscape) {
       lastTimerUpdate = now;
       refreshTimerLandscape();
+      drawSyncIcon();
     } else if (currentScreen == SCR_SESSION) {
       lastTimerUpdate = now;
       refreshTimer();
@@ -2075,7 +2207,6 @@ void loop() {
         M5.Speaker.tone(2200, 10);
         delay(30);
         M5.Speaker.tone(2600, 10);
-        drawSyncIndicator();
         lastFetchMs = 0;
         orientCooldown = millis() + 5000;
         orientLandscapeVotes = 0;
@@ -2085,17 +2216,56 @@ void loop() {
     if (shakeCount > 0 && now - shakeWindowStart > 800) shakeCount = 0;
   }
 
-  // Auto-refresh when the 5-hour window resets
+  // Double-tap the case to refresh — software tap detection on the accel
+  static uint32_t lastTapPoll = 0;
+  static bool tapInSpike = false;
+  static uint32_t firstTapMs = 0;
+  static uint8_t tapEdges = 0;
+  if (M5.Imu.isEnabled() && !fetching && now - lastTapPoll >= 20) {
+    lastTapPoll = now;
+    M5.Imu.update();
+    float ax, ay, az;
+    M5.Imu.getAccel(&ax, &ay, &az);
+    float mag = sqrtf(ax * ax + ay * ay + az * az);
+    if (!tapInSpike && mag > 1.45f) {
+      tapInSpike = true;                         // rising edge = one tap
+      if (tapEdges == 0) {
+        tapEdges = 1;
+        firstTapMs = now;
+      } else if (now - firstTapMs >= 80 && now - firstTapMs <= 600) {
+        tapEdges = 0;                            // second tap in window → double-tap
+        if (now - lastShakeRefresh > 8000) {     // shares the manual-refresh cooldown
+          lastShakeRefresh = now;
+          usageIdle = false;
+          idleFetchCount = 0;
+          freeRelaxCanvas();
+          M5.Speaker.tone(2000, 10); delay(30); M5.Speaker.tone(2400, 10);
+          lastFetchMs = 0;
+          orientCooldown = millis() + 5000;
+          Serial.println("[tap] double-tap refresh");
+        }
+      }
+    } else if (tapInSpike && mag < 1.2f) {
+      tapInSpike = false;                         // spike cleared — ready for the next edge
+    }
+    if (tapEdges == 1 && now - firstTapMs > 600) tapEdges = 0;  // window expired
+  }
+
+  // Auto-refresh when the 5-hour window resets — once per epoch, never loops
+  static time_t lastAutoRefreshEpoch = 0;
   if (!fetching && fiveHourResetEpoch > 0) {
     time_t t; time(&t);
-    if (t > (time_t)fiveHourResetEpoch && now - lastFetchMs > 30000) {
+    if (t > (time_t)fiveHourResetEpoch
+        && (time_t)fiveHourResetEpoch != lastAutoRefreshEpoch
+        && now - lastFetchMs > 30000) {
+      lastAutoRefreshEpoch = (time_t)fiveHourResetEpoch;
       Serial.println("[auto] reset epoch passed, refreshing");
       lastFetchMs = 0;
     }
   }
 
   // Sync double-pulse animation
-  if (WiFi.status() == WL_CONNECTED && !fetching && usage.fetchedAt > 0) {
+  if (!isLandscape && WiFi.status() == WL_CONNECTED && !fetching && usage.fetchedAt > 0) {
     static float pulseProgress = 0;
     static uint8_t pulseCount = 0;
 
@@ -2121,7 +2291,7 @@ void loop() {
         } else {
           // Done — both pulses complete
           lcd.fillCircle(cx, cy, 13, currBg);
-          lcd.fillCircle(cx, cy, 2, currMeter);
+          lcd.fillCircle(cx, cy, 3, currMeter);
           pulseActive = false;
           pulseCount = 0;
           pulseProgress = 0;
@@ -2130,11 +2300,11 @@ void loop() {
         float eased = 1.0f - (1.0f - pulseProgress) * (1.0f - pulseProgress) * (1.0f - pulseProgress);
         float wobble = sinf(pulseProgress * 15.0f) * 1.0f;
         float maxR = 12.0f;
-        float r = 3.0f + maxR * eased + wobble;
+        float r = 4.0f + maxR * eased + wobble;
         float fade = (1.0f - eased) * (1.0f - eased);
 
         lcd.fillCircle(cx, cy, 13, currBg);
-        lcd.fillCircle(cx, cy, 2, currMeter);
+        lcd.fillCircle(cx, cy, 3, currMeter);
 
         if (fade > 0.02f) {
           uint16_t ringColor = lerpColor(currBg, currMeter, fade);
