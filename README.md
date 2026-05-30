@@ -8,18 +8,37 @@ If you've hit Claude's usage limits mid-conversation, you know the frustration. 
 
 This fixes that. Plug it in, set it on your desk, and your usage is always one glance away. No API costs—it just reads from Claude.ai's usage endpoint with your session cookie.
 
-Four screens, one button press apart:
+## v1.1—Polish Release
 
-- **Session**—The main screen. A 240° arc gauge with your current 5-hour usage percentage, a live countdown until reset, a velocity arrow showing whether you're trending up or down, and a status label (Low, Moderate, High, Critical). The arc breathes—layered shadows drift at the fill edge so you know the thing is alive and working.
+Split the old DEVICE screen into CONNECTION and DEVICE. CONNECTION shows WiFi SSID, signal strength (RSSI in dBm), API status, and sync time. DEVICE is now hardware-only—power voltage, chip temp in both °F and °C, and uptime since boot. Five screens instead of four.
+
+The session arc is anti-aliased in both orientations—supersampled at 3× and downscaled so the edges are smooth instead of stair-stepped. When new data arrives the arc sweeps and the number counts to the new value with an ease-out curve instead of snapping. Breathing shadow bands pulse beyond the fill at two different sine rates.
+
+Audio got real: distinct chimes when usage crosses 50%, 75%, and 90% so you hear the device shift gears from across the room without looking. An ascending chord plays when the 5-hour window resets back to zero—a little "you're free" moment. Normal fetches still get the subtle two-tone ding.
+
+Double-tap the case to refresh—firmware detects two quick taps on the accelerometer and triggers a fetch without buttons or shaking. Shares the 8-second cooldown with shake so you can't spam it.
+
+Fetch interval is adaptive. Polls every 10 minutes under 60% usage, every 5 minutes from 60–80%, every 2 minutes above 80%. More data when you're watching the gauge, less when you're not.
+
+When your session key expires the session screen shows a clear KEY EXPIRED notice with a "hold A to re-setup" hint instead of a raw HTTP code.
+
+Relax mode drifts the dot grid in a random direction each time it activates—subtle, but it makes the idle screen feel alive.
+
+Under the hood—CPU dropped from 240 to 160 MHz (the workload doesn't need it, saves power, runs a few degrees cooler), WiFi modem sleep enabled between fetches, ~160 lines of dead code removed, typography standardized across all screens, and a handful of bug fixes including the 0%/reset ping loop that caused rapid API calls and premature relax mode, landscape dot flicker, the arc gap painting over the status label, and transition glitches between relax and session screens.
+
+Five screens, one button press apart:
+
+- **Session**—The main screen. A 240° arc gauge with your current 5-hour usage percentage, a live countdown until reset, and a status label (Low, Moderate, High, Critical). The arc breathes—layered shadows drift at the fill edge so you know the thing is alive and working.
 - **Usage**—A trend chart of your usage over the last 5 hours with a filled curve, plus breakdowns for overall, Sonnet, and design tool usage with progress bars.
-- **Device**—WiFi status, power source, last sync time, API health. The "is this thing on?" screen.
+- **Connection**—WiFi network, signal strength, API status, and last sync time. The "is this thing on?" screen.
+- **Device**—Power voltage, chip temperature in °F and °C, and uptime since boot.
 - **Key Status**—Session key validity, age, and estimated expiration. The expiration countdown changes color as it gets close.
 
 ## Features
 
-**Auto-updates every 5 minutes.** A rising double-chime means you're fine. A falling tone means you should probably wrap up what you're doing.
+**Adaptive updates.** Polls every 10 minutes under 60% usage, every 5 minutes from 60–80%, every 2 minutes above 80%. Distinct chimes play when usage crosses 50%, 75%, and 90%. An ascending chord plays when the window resets.
 
-**Shake to refresh.** Don't want to wait 5 minutes? Shake the device or press the side button (B). An orbiting dot plays while it syncs.
+**Shake to refresh.** Don't want to wait? Shake the device, press the side button (B), or double-tap the case. An orbiting dot plays while it syncs.
 
 **Three 'Themes'.** There are three "themes". They have official names: Double-press the side button (B) to rotate:
 - **Amber Cream**—warm orange (default), vintage
@@ -86,16 +105,16 @@ Long-press the front button (A) for 3 seconds—a progress bar fills at the bott
 | Change theme | Double-press side button (B) |
 | Night mode | Hold side button (B), 2 seconds |
 | Shake refresh | Shake the device |
+| Double-tap case | Refresh (gentler alternative to shake) |
 | Enter setup | Hold front button (A), 3 seconds |
 
 ## Limitations + Known Issues
 
 - **The usage endpoint is unofficial.** This reads from Claude.ai's internal API, not a documented public endpoint. Anthropic could change or remove it at any time.
 - **Session cookies expire.** There's no way around this—you'll need to update your `sessionKey` periodically. The Key Status screen tells you when it's getting close.
-- **Landscape is session-only.** The other three screens are portrait only. Tilt back upright to access them.
+- **Landscape is session-only.** The other four screens are portrait only. Tilt back upright to access them.
 - **No battery percentage.** The M5PM1 power chip doesn't expose accurate battery telemetry. The device shows "USB" when plugged in, which is the honest answer. It's designed to stay plugged in anyway.
 - **Requires WiFi.** No offline mode. If your network goes down, the device shows stale data until it reconnects.
-- **Flickering.** The device may flicker slightly at times. I am working on a fix for this.
 
 ## Build
 

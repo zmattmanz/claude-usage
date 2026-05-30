@@ -1212,8 +1212,8 @@ static void drawKeyStatus() {
 
   time_t t; time(&t);
   int ageDays = 0, ageHours = 0;
-  bool keyValid   = (usage.httpCode == 200);
-  bool keyExpired = (usage.httpCode == 401 || usage.httpCode == 403);
+  bool keyValid  = (usage.httpCode == 200);
+  bool isExpired = (usage.httpCode == 401 || usage.httpCode == 403);
 
   if (keySetEpoch > 0 && t > (time_t)keySetEpoch) {
     int ageSec = (int)(t - (time_t)keySetEpoch);
@@ -1226,7 +1226,7 @@ static void drawKeyStatus() {
   drawSpaced("STATUS", 8, y, 2);
   lcd.setFont(&BebasNeue20);
   lcd.setTextColor(0xFFFF, currBg);
-  if (keyExpired)     lcd.drawString("EXPIRED", 8, y + 16);
+  if (isExpired)      lcd.drawString("EXPIRED", 8, y + 16);
   else if (keyValid)  lcd.drawString("ACTIVE",  8, y + 16);
   else                lcd.drawString("UNKNOWN", 8, y + 16);
   y += 50;
@@ -1422,23 +1422,10 @@ static void drawScreen() {
 static void drawRelaxFrame();  // forward declaration — defined after slideTransition
 
 static void themeTransition(uint8_t fromIdx, uint8_t toIdx) {
-  int sw = isLandscape ? W_L : W;
-  int sh = isLandscape ? H_L : H;
-
   uint16_t fM = THEMES[fromIdx].meter,  tM = THEMES[toIdx].meter;
   uint16_t fL = THEMES[fromIdx].label,  tL = THEMES[toIdx].label;
   uint16_t fT = THEMES[fromIdx].track,  tT = THEMES[toIdx].track;
   uint16_t fB = THEMES[fromIdx].bg,     tB = THEMES[toIdx].bg;
-
-  bool relaxActive = usageIdle && (isLandscape || currentScreen == SCR_SESSION);
-
-  M5Canvas frame(&M5.Display);
-  bool useSprite = false;
-  if (!relaxActive) {
-    frame.setColorDepth(16);
-    frame.setPsram(true);
-    useSprite = frame.createSprite(sw, sh);
-  }
 
   const int steps = 10;
   for (int s = 1; s <= steps; s++) {
@@ -1452,31 +1439,12 @@ static void themeTransition(uint8_t fromIdx, uint8_t toIdx) {
     currTrack  = lerpColor(fT, tT, e);
     currBg     = lerpColor(fB, tB, e);
 
-    if (relaxActive) {
-      drawRelaxFrame();
-    } else if (useSprite) {
-      _gfx = &frame;
-      drawScreen();
-      _gfx = &M5.Display;
-      frame.pushSprite(0, 0);
-    } else {
-      drawScreen();
-    }
+    drawScreenBuffered();
     delay(18);
   }
 
   currMeter = tM; currLabel = tL; currTrack = tT; currBg = tB;
-  if (relaxActive) {
-    drawRelaxFrame();
-  } else if (useSprite) {
-    _gfx = &frame;
-    drawScreen();
-    _gfx = &M5.Display;
-    frame.pushSprite(0, 0);
-    frame.deleteSprite();
-  } else {
-    drawScreen();
-  }
+  drawScreenBuffered();
 }
 
 static void slideTransition() {
@@ -2069,6 +2037,9 @@ void loop() {
   }
   if (bCount == 2 && now - bLastMs > 100) {
     bCount = 0;
+    usageIdle = false;
+    idleFetchCount = 0;
+    freeRelaxCanvas();
     uint8_t oldIdx = themeIdx;
     themeIdx = (themeIdx + 1) % THEME_COUNT;
     M5.Speaker.tone(2200, 15);
@@ -2083,6 +2054,7 @@ void loop() {
     usageIdle = false;
     idleFetchCount = 0;
     freeRelaxCanvas();
+    drawScreenBuffered();
     M5.Speaker.tone(2000, 10);
     lastFetchMs = 0;
   }
@@ -2239,6 +2211,7 @@ void loop() {
           usageIdle = false;
           idleFetchCount = 0;
           freeRelaxCanvas();
+          drawScreenBuffered();
           M5.Speaker.tone(2000, 10); delay(30); M5.Speaker.tone(2400, 10);
           lastFetchMs = 0;
           orientCooldown = millis() + 5000;
