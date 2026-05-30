@@ -107,14 +107,6 @@ pio run -t upload --upload-port COM4
 
 Swap `COM4` for your port.
 
-## Dependencies
-
-- **espressif32** (^6.9.0)
-- **M5Unified** (^0.2.4)
-- **ArduinoJson** (^7.2.0)
-
-Custom fonts (Bebas Neue, Montserrat) included as headers in `src/`.
-
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
