@@ -2022,7 +2022,7 @@ void loop() {
   } else {
     if (btnAHoldStart > 0 && !btnALong) {
       uint32_t held = now - btnAHoldStart;
-      if (held > 500) drawScreen();
+      if (held > 500) drawScreenBuffered();
     }
     btnAHoldStart = 0;
     btnALong = false;
