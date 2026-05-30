@@ -190,7 +190,10 @@ static uint16_t currMeter, currLabel, currTrack, currBg;
 // ──────────── Timing ────────────
 static uint32_t lastFetchMs    = 0;
 
+static bool usageIdle = false;
+
 static unsigned long getFetchInterval() {
+  if (usageIdle) return 90UL * 1000;           // relax mode — poll often so it wakes ~90s after you resume
   float pct = usage.fiveHour.pct;
   if (pct >= 80.0f) return 2UL * 60 * 1000;    // 2 min — critical, watch closely
   if (pct >= 60.0f) return 5UL * 60 * 1000;    // 5 min — moderate
@@ -205,7 +208,6 @@ static uint32_t lastPulseFrame = 0;
 static bool pulseActive = false;
 static bool isLandscape = false;
 static bool nightMode = false;
-static bool usageIdle = false;
 static bool keyExpired = false;
 static int idleFetchCount = 0;
 static float lastIdlePct = -1;
@@ -492,6 +494,11 @@ static void fetchUsage() {
   http.end();
   yield();
   fetching = false; lastFetchMs = millis();
+}
+
+static void fetchTask(void* param) {
+  fetchUsage();          // sets fetching = false when done (all exit paths)
+  vTaskDelete(NULL);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1921,18 +1928,26 @@ void loop() {
   breathPhase += 0.025f;  // ~3.2 second full cycle at 20ms loop
   if (breathPhase > 6.2832f) breathPhase -= 6.2832f;
 
-  // Periodic fetch
+  // Launch the fetch on a background task so the UI keeps animating
   if (!fetching && (lastFetchMs == 0 || now - lastFetchMs >= getFetchInterval())) {
-    if (usage.fetchedAt > 0) drawSyncIndicator();
-    fetchUsage();
+    fetching = true;
+    if (xTaskCreatePinnedToCore(fetchTask, "fetch", 16384, NULL, 1, NULL, 0) != pdPASS) {
+      fetching = false;
+      lastFetchMs = millis();   // couldn't spawn — back off, retry next interval
+      Serial.println("[fetch] task spawn failed, will retry");
+    }
+  }
+
+  // Handle fetch completion — runs once when the background task finishes
+  static bool wasFetching = false;
+  if (wasFetching && !fetching) {
     float pctTarget = displayedPct;
     if (usage.valid) {
-      pctTarget          = usage.fiveHour.pct;   // animate to this
+      pctTarget          = usage.fiveHour.pct;
       displayedWeeklyPct = usage.weekly.pct;
       displayedSonnetPct = usage.sonnet.pct;
       displayedDesignPct = usage.design.pct;
     }
-    // Detect usage idle — 3 consecutive fetches with no change
     if (usage.valid) {
       if (fabsf(usage.fiveHour.pct - lastIdlePct) < 0.5f) {
         idleFetchCount++;
@@ -1948,7 +1963,7 @@ void loop() {
         relaxBaseY = 80;
         relaxPhase = 0;
         float driftAng = (float)(esp_random() % 360) * DEG_TO_RAD;
-        relaxDriftVX = cosf(driftAng) * 0.4f;   // random direction, gentle speed
+        relaxDriftVX = cosf(driftAng) * 0.4f;
         relaxDriftVY = sinf(driftAng) * 0.4f;
         relaxDriftOX = 0;
         relaxDriftOY = 0;
@@ -1956,15 +1971,29 @@ void loop() {
       }
     }
     if (usageIdle && (isLandscape || currentScreen == SCR_SESSION)) {
-      displayedPct = pctTarget;                 // relax is showing — keep value in sync, don't redraw
+      displayedPct = pctTarget;
     } else if (usage.valid && !keyExpired && (isLandscape || currentScreen == SCR_SESSION)) {
-      animatePctTo(pctTarget);                  // sweep the arc + number to the new value
+      animatePctTo(pctTarget);
     } else {
       displayedPct = pctTarget;
       drawScreenBuffered();
     }
-    lastShakeRefresh = millis();  // block shakes after any fetch
+    lastShakeRefresh = millis();
     orientCooldown = millis() + 3000;
+  }
+  wasFetching = fetching;
+
+  // Syncing spinner — animates at the sync dot while the background fetch runs
+  static uint32_t lastSpinFrame = 0;
+  static float spinAngle = 0;
+  if (fetching && usage.fetchedAt > 0 && now - lastSpinFrame > 40) {
+    lastSpinFrame = now;
+    int cx, cy;
+    getSyncPos(cx, cy);
+    lcd.fillCircle(cx, cy, 6, currBg);
+    spinAngle += 28.0f;
+    if (spinAngle >= 360.0f) spinAngle -= 360.0f;
+    lcd.fillArc(cx, cy, 6, 3, spinAngle, spinAngle + 110, currMeter);
   }
 
   // Button A: cycle screens (300ms debounce)
@@ -2032,10 +2061,10 @@ void loop() {
   static uint8_t bCount = 0;
   static uint32_t bLastMs = 0;
   if (M5.BtnB.wasPressed()) {
-    if (now - bLastMs < 400) { bCount++; } else { bCount = 1; }
+    if (now - bLastMs < 500) { bCount++; } else { bCount = 1; }
     bLastMs = now;
   }
-  if (bCount == 2 && now - bLastMs > 100) {
+  if (bCount == 2) {
     bCount = 0;
     usageIdle = false;
     idleFetchCount = 0;
@@ -2049,7 +2078,7 @@ void loop() {
     themeSaveAt = now + 5000;
     Serial.printf("[theme] %s\n", theme().name);
   }
-  if (bCount == 1 && now - bLastMs > 400 && !M5.BtnB.isPressed()) {
+  if (bCount == 1 && now - bLastMs > 500 && !M5.BtnB.isPressed()) {
     bCount = 0;
     usageIdle = false;
     idleFetchCount = 0;
@@ -2098,7 +2127,7 @@ void loop() {
     if (isLandscape) {
       lastBreathRedraw = now;
       drawArcAALandscape();
-      drawSyncIcon();
+      if (!fetching) drawSyncIcon();
     } else if (currentScreen == SCR_SESSION) {
       lastBreathRedraw = now;
       drawArcAA();
@@ -2107,7 +2136,7 @@ void loop() {
 
   // Countdown timer — update every second
   static uint32_t lastTimerUpdate = 0;
-  if (!usageIdle && usage.valid && !keyExpired && now - lastTimerUpdate > 1000) {
+  if (!usageIdle && usage.valid && !keyExpired && !fetching && now - lastTimerUpdate > 1000) {
     if (isLandscape) {
       lastTimerUpdate = now;
       refreshTimerLandscape();
