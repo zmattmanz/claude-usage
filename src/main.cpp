@@ -526,54 +526,35 @@ static void drawSyncIcon() {
   }
 }
 
-static void drawSyncIndicator() {
+static void drawSyncWaveFrame(float phase, float life) {
+  if (usage.fetchedAt == 0) return;
   int cx, cy;
   getSyncPos(cx, cy);
-
-  const int lineW  = 22;
-  const int amp    = 4;
-  const int frames = 56;                                  // smoother (~1s)
-  const float k = (2.0f * 3.14159f * 2.0f) / lineW;       // exactly 2 even waves
-  const int spW = lineW + 5;
-  const int spH = (amp + 2) * 2 + 1;
-  const int sx  = cx - lineW - 1;
-  const int sy  = cy - amp - 2;
+  const int lineW = 22, amp = 4;
+  const float k = (2.0f * 3.14159f * 2.0f) / lineW;   // exactly 2 even waves
+  const int spW = lineW + 5, spH = (amp + 2) * 2 + 1;
+  const int sx = cx - lineW - 1, sy = cy - amp - 2;
   const int midY = amp + 2;
 
-  M5Canvas spr(&M5.Display);
-  spr.setColorDepth(16);
-  spr.setPsram(true);
-  bool useSprite = spr.createSprite(spW, spH);
-
-  if (useSprite) {
-    for (int f = 0; f < frames; f++) {
-      float phase = f * 0.42f;
-
-      float life;
-      if (f < 5)                 life = f / 5.0f;
-      else if (f >= frames - 5)  life = (frames - 1 - f) / 5.0f;
-      else                       life = 1.0f;
-
-      spr.fillSprite(currBg);
-      int prevYp = midY;
-      for (int xx = 0; xx <= lineW; xx++) {
-        // Pure sine wave — uniform amplitude across the whole line, no taper
-        float yy = midY + sinf(xx * k + phase) * amp * life;
-        int yp = (int)(yy + 0.5f);
-        if (xx > 0) {
-          spr.drawLine(xx - 1, prevYp,     xx, yp,     currMeter);
-          spr.drawLine(xx - 1, prevYp + 1, xx, yp + 1, currMeter);
-        }
-        prevYp = yp;
-      }
-      spr.pushSprite(sx, sy);
-      delay(18);
-    }
-    spr.deleteSprite();
+  static M5Canvas* syncWave = nullptr;
+  if (!syncWave) {
+    syncWave = new M5Canvas(&M5.Display);
+    syncWave->setColorDepth(16);
+    syncWave->setPsram(true);
+    if (!syncWave->createSprite(spW, spH)) { delete syncWave; syncWave = nullptr; return; }
   }
-
-  lcd.fillRect(sx, sy, spW, spH, currBg);
-  lcd.fillCircle(cx, cy, 3, currMeter);
+  syncWave->fillSprite(currBg);
+  int prevYp = midY;
+  for (int xx = 0; xx <= lineW; xx++) {
+    float yy = midY + sinf(xx * k + phase) * amp * life;
+    int yp = (int)(yy + 0.5f);
+    if (xx > 0) {
+      syncWave->drawLine(xx - 1, prevYp,     xx, yp,     currMeter);
+      syncWave->drawLine(xx - 1, prevYp + 1, xx, yp + 1, currMeter);
+    }
+    prevYp = yp;
+  }
+  syncWave->pushSprite(sx, sy);
 }
 
 
@@ -1983,17 +1964,18 @@ void loop() {
   }
   wasFetching = fetching;
 
-  // Syncing spinner — animates at the sync dot while the background fetch runs
-  static uint32_t lastSpinFrame = 0;
-  static float spinAngle = 0;
-  if (fetching && usage.fetchedAt > 0 && now - lastSpinFrame > 40) {
-    lastSpinFrame = now;
-    int cx, cy;
-    getSyncPos(cx, cy);
-    lcd.fillCircle(cx, cy, 6, currBg);
-    spinAngle += 28.0f;
-    if (spinAngle >= 360.0f) spinAngle -= 360.0f;
-    lcd.fillArc(cx, cy, 6, 3, spinAngle, spinAngle + 110, currMeter);
+  // Syncing squiggle — scrolling sine wave by the sync dot while the fetch runs
+  static uint32_t lastSyncWaveFrame = 0;
+  static float syncWavePhase = 0;
+  static int syncWaveFrames = 0;
+  if (fetching && usage.fetchedAt > 0 && now - lastSyncWaveFrame > 18) {
+    lastSyncWaveFrame = now;
+    syncWavePhase += 0.42f;
+    syncWaveFrames++;
+    float life = (syncWaveFrames < 6) ? syncWaveFrames / 6.0f : 1.0f;   // ease the amplitude in
+    drawSyncWaveFrame(syncWavePhase, life);
+  } else if (!fetching) {
+    syncWaveFrames = 0;   // reset so it eases in again next fetch
   }
 
   // Button A: cycle screens (300ms debounce)
@@ -2123,11 +2105,11 @@ void loop() {
 
   // Breathing animation — partial arc redraw
   static uint32_t lastBreathRedraw = 0;
-  if (!usageIdle && usage.valid && !keyExpired && now - lastBreathRedraw > 120) {
+  if (!usageIdle && usage.valid && !keyExpired && !fetching && now - lastBreathRedraw > 120) {
     if (isLandscape) {
       lastBreathRedraw = now;
       drawArcAALandscape();
-      if (!fetching) drawSyncIcon();
+      drawSyncIcon();
     } else if (currentScreen == SCR_SESSION) {
       lastBreathRedraw = now;
       drawArcAA();
