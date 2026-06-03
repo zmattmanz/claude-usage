@@ -207,6 +207,7 @@ static bool pulseActive = false;
 static bool isLandscape = false;
 static bool nightMode = false;
 static bool keyExpired = false;
+static bool batteryLow = false;
 static int idleFetchCount = 0;
 static float lastIdlePct = -1;
 static float lastChimePct = -1;   // previous fetch's % — for threshold-crossing chimes
@@ -338,7 +339,7 @@ static void wifiConnect() {
     Serial.printf("[wifi] connected, IP=%s\n", WiFi.localIP().toString().c_str());
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // offset=0 = UTC — required for countdown timer
     struct tm tm_info; getLocalTime(&tm_info, 5000);
-    WiFi.setSleep(true);  // modem sleep between fetches — saves power, no UX cost
+    WiFi.setSleep(false);  // keep radio steady — modem sleep's current cycling dims the backlight
   } else {
     Serial.println("[wifi] connection failed, entering setup mode");
     lcd.fillRect(0, 0, W, H, currBg);
@@ -515,7 +516,9 @@ static void drawSyncIcon() {
   if (usage.fetchedAt == 0) return;
   int cx, cy;
   getSyncPos(cx, cy);
-  if (WiFi.status() != WL_CONNECTED) {
+  if (batteryLow) {
+    lcd.fillCircle(cx, cy, 3, 0xF800);            // red — battery low until recharged
+  } else if (WiFi.status() != WL_CONNECTED) {
     lcd.drawCircle(cx, cy, 3, 0xFFFF);
   } else {
     lcd.fillCircle(cx, cy, 3, currMeter);
@@ -1149,11 +1152,11 @@ static void drawDevice() {
   lcd.setFont(&BebasNeue20); lcd.setTextColor(0xFFFF, currBg);
   int32_t mv = M5.Power.getBatteryVoltage();
   bool charging = M5.Power.isCharging();
-  char powerStr[16];
+  char powerStr[20];
   if (charging) {
-    snprintf(powerStr, sizeof(powerStr), "USB %dmV", (int)mv);
+    snprintf(powerStr, sizeof(powerStr), "USB %.2fV", mv / 1000.0f);
   } else {
-    snprintf(powerStr, sizeof(powerStr), "%dmV", (int)mv);
+    snprintf(powerStr, sizeof(powerStr), "%.2fV", mv / 1000.0f);
   }
   lcd.drawString(powerStr, 8, y + 16);
   y += step;
@@ -2243,7 +2246,7 @@ void loop() {
   }
 
   // Sync double-pulse animation
-  if (!isLandscape && WiFi.status() == WL_CONNECTED && !fetching && usage.fetchedAt > 0) {
+  if (!isLandscape && !batteryLow && WiFi.status() == WL_CONNECTED && !fetching && usage.fetchedAt > 0) {
     static float pulseProgress = 0;
     static uint8_t pulseCount = 0;
 
@@ -2291,6 +2294,20 @@ void loop() {
         }
       }
     }
+  }
+
+  // Low-battery check — voltage-based (M5PM1 percentage is unreliable)
+  static uint32_t lastBatCheck = 0;
+  static int lowCount = 0;
+  if (now - lastBatCheck > 5000) {
+    lastBatCheck = now;
+    bool charging = M5.Power.isCharging();
+    int mv = (int)M5.Power.getBatteryVoltage();
+    bool wasLow = batteryLow;
+    if (charging || mv > 3550) { batteryLow = false; lowCount = 0; }       // charging/healthy → clear
+    else if (mv > 2900 && mv < 3450) { if (++lowCount >= 2) batteryLow = true; }  // 2 reads → real low
+    else lowCount = 0;
+    if (batteryLow != wasLow && !usageIdle) drawScreenBuffered();          // refresh to flip the dot
   }
 
   // Heap check every 30s
