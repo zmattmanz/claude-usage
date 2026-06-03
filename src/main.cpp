@@ -153,7 +153,6 @@ struct Usage {
   UsageBucket fiveHour;
   UsageBucket weekly;
   UsageBucket sonnet;
-  UsageBucket design;
   uint32_t fetchedAt;
   bool valid;
   int httpCode;
@@ -183,7 +182,6 @@ static uint32_t keySetEpoch = 0;
 static float displayedPct = 0;
 static float displayedWeeklyPct = 0;
 static float displayedSonnetPct = 0;
-static float displayedDesignPct = 0;
 static float breathPhase = 0.0f;
 static uint16_t currMeter, currLabel, currTrack, currBg;
 
@@ -435,8 +433,6 @@ static void fetchUsage() {
         const char* r = sd["resets_at"]; if (r) parseResetTime(r, usage.weekly.resets, 32); }
       JsonObject sn = doc["seven_day_sonnet"];
       if (!sn.isNull()) { usage.sonnet.pct = sn["utilization"]|0.0f; usage.sonnet.available = true; }
-      JsonObject dm = doc["seven_day_omelette"];
-      if (!dm.isNull()) { usage.design.pct = dm["utilization"]|0.0f; usage.design.available = true; }
       usage.valid = true; usage.error[0] = 0; usage.fetchedAt = millis();
       keyExpired = false;
       if (keySetEpoch == 0) {
@@ -1039,13 +1035,12 @@ static void drawUsage() {
   Row rows[] = {
     { "ALL",    displayedWeeklyPct, usage.weekly.available },
     { "SONNET", displayedSonnetPct, usage.sonnet.available },
-    { "DESIGN", displayedDesignPct, usage.design.available },
   };
 
   int y = axisY + 16;
-  const int rowH = 33;
+  const int rowH = 44;
 
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 2; i++) {
     char pctBuf[6]; snprintf(pctBuf, sizeof(pctBuf), "%.0f", rows[i].pct);
 
     lcd.setFont(&BebasNeue20);
@@ -1927,7 +1922,6 @@ void loop() {
       pctTarget          = usage.fiveHour.pct;
       displayedWeeklyPct = usage.weekly.pct;
       displayedSonnetPct = usage.sonnet.pct;
-      displayedDesignPct = usage.design.pct;
     }
     if (usage.valid) {
       if (fabsf(usage.fiveHour.pct - lastIdlePct) < 0.5f) {
@@ -1968,7 +1962,7 @@ void loop() {
   static uint32_t lastSyncWaveFrame = 0;
   static float syncWavePhase = 0;
   static int syncWaveFrames = 0;
-  if (fetching && usage.fetchedAt > 0 && now - lastSyncWaveFrame > 18) {
+  if (fetching && !usageIdle && usage.fetchedAt > 0 && now - lastSyncWaveFrame > 18) {
     lastSyncWaveFrame = now;
     syncWavePhase += 0.42f;
     syncWaveFrames++;
